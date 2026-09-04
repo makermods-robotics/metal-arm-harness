@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "metal-arm-harness"
+version = "0.1.0"
+description = "A small LLM-as-policy harness for real robot arms, with a physical safety envelope. Ships the MakerMods Metal arm; arm-agnostic above the driver layer."
+readme = "README.md"
+# lerobot (the Damiao driver layer) requires >=3.12.
+requires-python = ">=3.12"
+license = "MIT"
+authors = [{ name = "MakerMods" }]
+
+dependencies = [
+    "anthropic>=0.40",
+    "numpy>=1.26",
+    "pillow>=10.0",
+    "pin>=3.0",              # Pinocchio, for forward kinematics
+    "lerobot[damiao]>=0.4",  # DamiaoMotorsBus + MetalFollower (see tool.uv.sources)
+]
+
+[project.optional-dependencies]
+camera = ["opencv-python>=4.8"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.scripts]
+metal-arm-harness = "metal_arm_harness.cli:main"
+
+[tool.uv.sources]
+# The Metal robot classes live on lerobot's arm/makermods-metal branch, not on PyPI.
+lerobot = { git = "https://github.com/makermods-robotics/lerobot.git", branch = "arm/makermods-metal" }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/metal_arm_harness"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "RUF"]
