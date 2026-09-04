@@ -25,8 +25,20 @@ The rules, in the order a move meets them:
 5. **Runtime vetoes** — non-finite feedback and over-temperature motors
    abort the episode between waypoints.
 
-A rejection is a `MoveRejected` carrying an explanation written for the LLM:
-it comes back as a correctable tool error, not a crash.
+Two refinements learned on the bench, both conservative:
+
+- **Recovery from inside the margin.** Gravity sag or the table-touch ritual
+  can leave the arm below `floor_margin_m`. From there a move is allowed only
+  if no waypoint is lower than the arm already is — jaws may close, the arm
+  may rise, nothing may descend further. Without this the envelope
+  deadlocks, rejecting even the lift that would fix it.
+- **The gripper is not geometry.** Opening or closing the jaws changes no
+  monitored height, so a gripper-only move is exempt from the excursion cap
+  and from the slow zone, and the gripper joint never counts toward the
+  per-move excursion of an arm move.
+
+A rejection is a `MoveRejected` carrying an explanation written for whoever
+is driving: it comes back as a correctable error, not a crash.
 """
 
 from __future__ import annotations
@@ -44,8 +56,9 @@ from metal_arm_harness.arms.base import ArmInfo, ArmState, Kinematics
 _MAX_WAYPOINTS = 100_000
 
 
+
 class MoveRejected(Exception):
-    """The move violates the envelope; the message is written for the LLM."""
+    """The move violates the envelope; the message is written for the driver."""
 
 
 class SafetyAbort(Exception):
@@ -150,6 +163,8 @@ class SafetyEnvelope:
         target = self.clamp_to_limits(raw)
 
         span = np.abs(target - current)
+        if self.info.gripper_index is not None:
+            span[self.info.gripper_index] = 0.0  # jaws are not geometry
         over = np.nonzero(span > self.config.max_excursion_deg)[0]
         if over.size:
             worst = int(over[np.argmax(span[over])])
@@ -160,14 +175,16 @@ class SafetyEnvelope:
                 "between them."
             )
 
+        gripper_only = self._is_gripper_only(current, target)
+        floor_limit = self._floor_limit(current)
         waypoints: list[npt.NDArray[np.float64]] = []
         q = current
         for _ in range(_MAX_WAYPOINTS):
             if bool(np.all(q == target)):
                 break
-            step = self._step_size(q, target)
+            step = self._full_step if gripper_only else self._step_size(q, target)
             q = q + np.clip(target - q, -step, step)
-            self._check_floor(q)
+            self._check_floor(q, floor_limit)
             waypoints.append(q)
         else:  # pragma: no cover - _MAX_WAYPOINTS is unreachable by design
             raise MoveRejected("move produced an unreasonable number of waypoints")
@@ -186,9 +203,33 @@ class SafetyEnvelope:
         clearance = self.clearance_m(joints_deg)
         return clearance is not None and clearance < self.config.slow_zone_m
 
-    def _check_floor(self, joints_deg: npt.NDArray[np.float64]) -> None:
+    def _is_gripper_only(
+        self, current: npt.NDArray[np.float64], target: npt.NDArray[np.float64]
+    ) -> bool:
+        if self.info.gripper_index is None:
+            return False
+        arm = np.ones(current.shape, dtype=bool)
+        arm[self.info.gripper_index] = False
+        return bool(np.all(current[arm] == target[arm]))
+
+    def _floor_limit(self, current: npt.NDArray[np.float64]) -> float:
+        """Clearance every waypoint must keep: the margin, or, when the arm
+        already sits under it, its present clearance (so it may not go lower)."""
+        clearance = self.clearance_m(current)
+        if clearance is None or clearance >= self.config.floor_margin_m:
+            return self.config.floor_margin_m
+        return clearance  # not one millimetre lower: no slack, or it ratchets
+
+    def _check_floor(self, joints_deg: npt.NDArray[np.float64], limit: float | None = None) -> None:
         clearance = self.clearance_m(joints_deg)
-        if clearance is not None and clearance < self.config.floor_margin_m:
+        limit = self.config.floor_margin_m if limit is None else limit
+        if clearance is not None and clearance < limit:
+            if limit < self.config.floor_margin_m:
+                raise MoveRejected(
+                    f"the arm is already {self.clearance_m(joints_deg) * 1000:.0f} mm from the "
+                    "table, under the hard-floor margin, and that move would take it lower. "
+                    "From here only moves that keep or raise the height are allowed: lift first."
+                )
             raise MoveRejected(
                 f"that move would bring the arm to {clearance * 1000:.0f} mm above the "
                 f"table, under the {self.config.floor_margin_m * 1000:.0f} mm hard floor. "
@@ -202,6 +243,13 @@ class SafetyEnvelope:
         """Veto continuing on unhealthy feedback, between waypoints."""
         if not bool(np.all(np.isfinite(state.positions_deg))):
             raise SafetyAbort("joint feedback went non-finite mid-move")
+        for index, fault in enumerate(state.faults):
+            if fault:
+                raise SafetyAbort(
+                    f"{self.info.joint_names[index]} motor reports a latched driver fault "
+                    f"({fault}); it is not producing torque. Clear it (operator: "
+                    "`op clear-faults`) and use a lower gripper lead cap if it was a stall"
+                )
         temps = np.asarray(state.temperatures_c, dtype=np.float64)
         hot = np.nonzero(np.isfinite(temps) & (temps > self.config.max_temp_c))[0]
         if hot.size:
@@ -214,13 +262,14 @@ class SafetyEnvelope:
     # ── prompt material ─────────────────────────────────────────────────────
 
     def describe(self) -> str:
-        """The envelope stated for the system prompt, in the model's terms."""
+        """The envelope stated in plain words, for operating notes and prompts."""
         lines = [
             f"Speed is limited to {self.config.max_speed_deg_s:.0f} deg/s; moves are "
             "interpolated, so a large change takes proportionally longer.",
-            f"No single move may change a joint by more than "
+            f"No single move may change an arm joint by more than "
             f"{self.config.max_excursion_deg:.0f} degrees; bigger motions must be split "
-            "across calls, with a look at the camera between them.",
+            "across calls, with a look at the camera between them. The gripper is exempt: "
+            "open or close it fully in one call.",
         ]
         if self.guards_height:
             lines.append(

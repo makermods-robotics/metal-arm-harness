@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "metal-arm-harness"
 version = "0.1.0"
-description = "A small LLM-as-policy harness for real robot arms, with a physical safety envelope. Ships the MakerMods Metal arm; arm-agnostic above the driver layer."
+description = "A safety-enveloped operator harness for real robot arms that any agent can drive from the command line. Ships the MakerMods Metal arm; arm-agnostic above the driver layer."
 readme = "README.md"
 # lerobot (the Damiao driver layer) requires >=3.12.
 requires-python = ">=3.12"
@@ -13,7 +13,6 @@ license = "MIT"
 authors = [{ name = "MakerMods" }]
 
 dependencies = [
-    "anthropic>=0.40",
     "numpy>=1.26",
     "pillow>=10.0",
     "pin>=3.0",              # Pinocchio, for forward kinematics

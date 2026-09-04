@@ -7,14 +7,19 @@ module adapts them to the harness's `Arm` contract and adds a bench simulator
 the entire harness runs with nothing plugged in.
 
 `MetalFollower.send_action` keeps its own soft-limit clamp and its
-`max_relative_target` per-tick cap (set to the harness's full-speed step), so
-the driver layer enforces the speed ceiling independently of the safety
-envelope above it.
+`max_relative_target` cap, here called the *lead cap*: each command may lead
+the MEASURED position by at most `lead_cap_deg`. It bounds how hard a firm
+gain can snap the arm, independently of the envelope above it — but it also
+bounds torque: under P control the motor can only pull with kp x lead. Tied
+to the envelope's 0.8°/tick step the elbow could not lift the forearm against
+gravity (measured on the bench); 2° gives ~2.5x the torque while the
+envelope's waypoint stream still fixes the speed.
 """
 
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -24,6 +29,31 @@ import numpy.typing as npt
 from metal_arm_harness.arms.base import Arm, ArmInfo, ArmState, JointSpec
 
 _SIM_TEMP_C = 32.0
+
+#: Per-command lead over the measured position the driver layer allows.
+DEFAULT_LEAD_CAP_DEG = 2.0
+
+#: Bench-tuned per-joint lead caps (degrees). Torque under P control is kp x lead:
+#: the shoulder cannot hold the arm at long reach with 2 deg, and the small gripper
+#: motor trips its rotor-overtemp fault above ~8 deg of sustained stall.
+METAL_LEAD_CAPS_DEG: dict[str, float] = {
+    "shoulder_lift": 5.0,
+    "elbow_flex": 3.0,
+    "gripper": 8.0,
+}
+
+#: Damiao status nibble (feedback byte 0, high 4 bits) -> fault text; 0/1 are healthy.
+DAMIAO_STATUS = {
+    0x8: "overvoltage",
+    0x9: "undervoltage",
+    0xA: "overcurrent",
+    0xB: "MOS overtemp",
+    0xC: "rotor overtemp",
+    0xD: "lost communication",
+    0xE: "overload",
+}
+_DAMIAO_CMD_ENABLE = 0xFC
+_DAMIAO_CMD_CLEAR_ERROR = 0xFB
 
 #: Where the simulated arm powers on: inside every soft limit, mid-workspace.
 SIM_START_DEG = {
@@ -61,6 +91,21 @@ how far past contact you command. To grasp, command a few degrees past where
 the jaws meet the object; do not slam to 0 around a rigid object."""
 
 
+def _lead_caps(lead_cap_deg: float | Mapping[str, float] | None) -> float | dict[str, float]:
+    """None -> the bench-tuned per-joint table; a number -> that for every joint;
+    a mapping -> overrides on top of the table."""
+    from lerobot.robots.metal_follower import MetalFollowerConfig
+
+    if isinstance(lead_cap_deg, (int, float)):
+        return float(lead_cap_deg)
+    caps = dict(METAL_LEAD_CAPS_DEG)
+    if lead_cap_deg is not None:
+        caps.update({k: float(v) for k, v in dict(lead_cap_deg).items()})
+    return {
+        m: float(caps.get(m, DEFAULT_LEAD_CAP_DEG)) for m in MetalFollowerConfig().motor_can_ids
+    }
+
+
 class MetalArm(Arm):
     """Metal over slcan (any OS), socketcan (Linux), or the bench sim."""
 
@@ -72,7 +117,7 @@ class MetalArm(Arm):
         robot_id: str = "metal_arm",
         cameras: str = "overhead=0",
         control_hz: float = 25.0,
-        max_step_deg: float = 0.8,
+        lead_cap_deg: float | Mapping[str, float] | None = None,
         armed: bool = False,
     ):
         from lerobot.robots.metal_follower import MetalFollower, MetalFollowerConfig
@@ -93,11 +138,14 @@ class MetalArm(Arm):
             id=robot_id,
             port=port or "sim",
             can_interface="slcan" if backend == "sim" else backend,
-            max_relative_target=max_step_deg,
+            max_relative_target=_lead_caps(lead_cap_deg),
             cameras={},
         )
         self._follower = MetalFollower(config)
         names = tuple(self._follower._joint_motor_names)
+        self._status: dict[str, int] = {}
+        if backend != "sim":
+            self._capture_status()
         limits = config.joint_limits
         self.info = ArmInfo(
             name="metal",
@@ -153,11 +201,57 @@ class MetalArm(Arm):
             positions_deg=np.array([states[n]["position"] for n in names], dtype=np.float64),
             velocities_deg_s=np.array([states[n]["velocity"] for n in names], dtype=np.float64),
             temperatures_c=np.array(
-                [max(states[n].get("temp_mos", 0.0), states[n].get("temp_rotor", 0.0))
-                 for n in names],
+                [
+                    max(states[n].get("temp_mos", 0.0), states[n].get("temp_rotor", 0.0))
+                    for n in names
+                ],
                 dtype=np.float64,
             ),
+            faults=tuple(DAMIAO_STATUS.get(self._status.get(n, 1), "") for n in names),
+            efforts_nm=tuple(float(states[n].get("torque", 0.0)) for n in names),
         )
+
+    def _capture_status(self) -> None:
+        """The LeRobot bus drops the Damiao status nibble; keep it per motor."""
+        bus = self._follower.bus
+        original = bus._process_response
+
+        def process(motor: str, msg: Any) -> None:
+            try:
+                self._status[motor] = int(msg.data[0]) >> 4
+            except Exception:
+                pass
+            original(motor, msg)
+
+        bus._process_response = process
+
+    def clear_faults(self) -> tuple[str, ...]:
+        """Send Damiao clear-error then enable to every faulted motor; return their names."""
+        if self._backend == "sim":
+            return ()
+        import can
+
+        bus = self._follower.bus
+        faulted = [n for n in self.info.joint_names if self._status.get(n, 1) >= 0x8]
+        for name in faulted:
+            motor_id = bus._get_motor_id(name)
+            for command in (_DAMIAO_CMD_CLEAR_ERROR, _DAMIAO_CMD_ENABLE):
+                bus.canbus.send(
+                    can.Message(
+                        arbitration_id=motor_id,
+                        data=[0xFF] * 7 + [command],
+                        is_extended_id=False,
+                        is_fd=bus.use_can_fd,
+                    )
+                )
+                time.sleep(0.05)
+                deadline = time.time() + 0.3
+                while time.time() < deadline:
+                    reply = bus.canbus.recv(timeout=0.1)
+                    if reply is not None and reply.arbitration_id == bus._get_motor_recv_id(name):
+                        bus._process_response(name, reply)
+                        break
+        return tuple(faulted)
 
     def frames(self) -> dict[str, npt.NDArray[np.uint8]]:
         return {camera.name: camera.read() for camera in self._cameras}

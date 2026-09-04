@@ -15,6 +15,7 @@ gripper undercut it.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from importlib.resources import as_file, files
 
@@ -77,6 +78,16 @@ class MetalKinematics(Kinematics):
         """Tool tip height in the base frame, for the table-touch ritual."""
         self._fk(joints_deg)
         return self._tool_tip_z()
+
+    def tool_pose(self, joints_deg: Sequence[float]) -> tuple[np.ndarray, float]:
+        """Tool tip position (m, base frame) and pitch (deg, negative = pointing down)."""
+        self._fk(joints_deg)
+        last = self._model.njoints - 1
+        placement = self._data.oMi[last]
+        tip = np.asarray(placement.act(self._tool), dtype=np.float64)
+        direction = np.asarray(placement.rotation[:, 0], dtype=np.float64)
+        pitch = math.degrees(math.atan2(direction[2], math.hypot(direction[0], direction[1])))
+        return tip, pitch
 
     def _tool_tip_z(self) -> float:
         last = self._model.njoints - 1

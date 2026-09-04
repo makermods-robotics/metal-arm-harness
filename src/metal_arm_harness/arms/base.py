@@ -1,11 +1,11 @@
 """The arm-agnostic contract every arm implements.
 
-The harness (safety envelope, executor, agent, CLI) is written against these
+The harness (safety envelope, executor, controller, operator CLI) is written against these
 types only. Adding a new arm means implementing `Arm` (and optionally
 `Kinematics`, without which the table guard is unavailable) and registering a
 factory in `arms/__init__.py` — nothing above this layer changes.
 
-Conventions the contract fixes, so the agent prompt can state them once:
+Conventions the contract fixes, so the operating notes can state them once:
 - joint positions and targets are absolute angles in DEGREES,
 - joints are ordered, named, and bounded by `ArmInfo.joints`,
 - `read()` is always safe; `send()` requires the harness to have armed torque.
@@ -56,11 +56,15 @@ class ArmState:
     positions_deg: npt.NDArray[np.float64]
     velocities_deg_s: npt.NDArray[np.float64]
     temperatures_c: npt.NDArray[np.float64]
+    #: Per-joint driver fault text ("" = healthy), when the arm reports it.
+    faults: tuple[str, ...] = ()
+    #: Measured joint torque in N·m, when the arm reports it (empty otherwise).
+    efforts_nm: tuple[float, ...] = ()
 
 
 @dataclass
 class Observation:
-    """What the agent sees after every tool call."""
+    """What the policy sees after every command: state plus camera frames."""
 
     state: ArmState
     frames: Mapping[str, npt.NDArray[np.uint8]] = field(default_factory=dict)
@@ -96,8 +100,13 @@ class Arm(abc.ABC):
         """Release the bus and cameras. Must not drop a holding arm."""
 
     def observe(self) -> Observation:
-        """State plus camera frames, the agent's per-turn input."""
+        """State plus camera frames, the policy's per-step input."""
         return Observation(state=self.read(), frames=self.frames())
+
+    def clear_faults(self) -> tuple[str, ...]:
+        """Clear latched driver faults and re-enable; returns the joints cleared.
+        Arms without latching drivers return ()."""
+        return ()
 
 
 class Kinematics(abc.ABC):

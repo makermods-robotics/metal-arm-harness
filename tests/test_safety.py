@@ -138,3 +138,83 @@ def test_bad_configs_are_refused() -> None:
 def test_describe_mentions_the_guard_only_when_calibrated() -> None:
     assert "table" not in _envelope(with_kin=True, floor=None).describe().lower()
     assert "hard floor" in _envelope().describe()
+
+
+# ── bench refinements: recovery from inside the margin, gripper exemptions ──
+
+
+def _gripper_info() -> ArmInfo:
+    return ArmInfo(
+        name="toy-gripper",
+        joints=(
+            JointSpec("lift", -200.0, 200.0),
+            JointSpec("other", -100.0, 100.0),
+            JointSpec("gripper", 0.0, 137.0),
+        ),
+        gripper_index=2,
+        control_hz=HZ,
+        notes="toy arm with jaws",
+    )
+
+
+class LinearKinematics3(LinearKinematics):
+    pass
+
+
+def _gripper_envelope() -> SafetyEnvelope:
+    envelope = SafetyEnvelope(SafetyConfig(), _gripper_info(), LinearKinematics3())
+    envelope.set_floor(0.0)
+    return envelope
+
+
+def test_inside_the_margin_a_rising_move_is_allowed() -> None:
+    # Start 5 mm above the table (under the 10 mm margin): lifting must work.
+    plan = _envelope().plan_move([5.0, 0.0], [30.0, 0.0])
+    assert plan[-1][0] == pytest.approx(30.0)
+
+
+def test_inside_the_margin_a_level_move_is_allowed() -> None:
+    plan = _envelope().plan_move([5.0, 0.0], [5.0, 20.0])
+    assert plan[-1][1] == pytest.approx(20.0)
+
+
+def test_inside_the_margin_going_lower_is_still_rejected() -> None:
+    with pytest.raises(MoveRejected, match="already"):
+        _envelope().plan_move([5.0, 0.0], [3.0, 0.0])
+
+
+def test_recovery_message_says_lift_first() -> None:
+    with pytest.raises(MoveRejected, match="lift first"):
+        _envelope().plan_move([5.0, 0.0], [2.0, 0.0])
+
+
+def test_gripper_move_is_exempt_from_the_excursion_cap() -> None:
+    plan = _gripper_envelope().plan_move([150.0, 0.0, 0.0], [150.0, 0.0, 112.0])
+    assert plan[-1][2] == pytest.approx(112.0)
+
+
+def test_arm_joint_excursion_cap_still_applies_with_a_gripper() -> None:
+    with pytest.raises(MoveRejected, match="per-move"):
+        _gripper_envelope().plan_move([150.0, 0.0, 0.0], [100.0, 0.0, 112.0])
+
+
+def test_gripper_only_move_near_the_table_runs_at_full_speed() -> None:
+    # 20 mm above the table is inside the slow zone, but jaws are not geometry.
+    plan = _gripper_envelope().plan_move([20.0, 0.0, 0.0], [20.0, 0.0, 40.0])
+    jumps = np.abs(np.diff(np.vstack([[20.0, 0.0, 0.0], plan]), axis=0)[:, 2])
+    assert np.max(jumps) == pytest.approx(FULL_STEP)
+
+
+def test_mixed_move_near_the_table_is_still_slow() -> None:
+    plan = _gripper_envelope().plan_move([20.0, 0.0, 0.0], [25.0, 0.0, 40.0])
+    jumps = np.abs(np.diff(np.vstack([[20.0, 0.0, 0.0], plan]), axis=0)[:, 0])
+    assert np.max(jumps) == pytest.approx(SLOW_STEP)
+
+
+def test_describe_mentions_the_gripper_exemption() -> None:
+    assert "gripper is exempt" in _gripper_envelope().describe()
+
+
+def test_inside_the_margin_even_half_a_millimetre_lower_is_rejected() -> None:
+    with pytest.raises(MoveRejected, match="already"):
+        _envelope().plan_move([5.0, 0.0], [4.5, 0.0])

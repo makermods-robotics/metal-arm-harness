@@ -102,3 +102,47 @@ def load_calibration(path: Path) -> TableCalibration:
     if not path.is_file():
         raise CalibrationError(f"no saved table calibration at {path}")
     return TableCalibration.from_json(path.read_text(encoding="utf-8"))
+
+
+def watch_for_touch(
+    arm: Arm,
+    kinematics: Kinematics,
+    *,
+    say: Callable[[str], None] = print,
+    move_m: float = 0.03,
+    still_m: float = 0.003,
+    still_s: float = 5.0,
+    timeout_s: float = 480.0,
+    poll_s: float = 0.2,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Callable[[str], str]:
+    """An `ask` for `run_table_ritual` that needs no keyboard.
+
+    It returns once the operator has moved the gripper (tip height changed by
+    `move_m`) and then held it still for `still_s`: the hands-free version of
+    "press ENTER when the tip is on the table", for sessions driven from a
+    terminal without stdin. Raises CalibrationError on timeout.
+    """
+
+    def ask(prompt: str) -> str:
+        say(prompt.strip() + f"  (watching: move the gripper, then hold still {still_s:.0f}s)")
+        start_z = kinematics.tool_tip_z_m(arm.read().positions_deg)
+        started = clock()
+        moved = False
+        window: list[tuple[float, float]] = []
+        while clock() - started < timeout_s:
+            z = kinematics.tool_tip_z_m(arm.read().positions_deg)
+            now = clock()
+            if not moved:
+                moved = abs(z - start_z) > move_m
+            else:
+                window.append((now, z))
+                window[:] = [(t, v) for t, v in window if now - t <= still_s]
+                spread = max(v for _, v in window) - min(v for _, v in window)
+                if now - window[0][0] >= still_s - poll_s and spread <= still_m:
+                    return ""
+            sleep(poll_s)
+        raise CalibrationError("timed out waiting for the gripper to be placed and held still")
+
+    return ask

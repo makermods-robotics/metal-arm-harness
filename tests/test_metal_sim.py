@@ -53,7 +53,7 @@ def test_follower_relative_cap_bounds_a_wild_command(arm: MetalArm) -> None:
     wild[0] += 50.0
     arm.send([float(v) for v in wild])
     moved = arm.read().positions_deg[0] - start[0]
-    assert abs(moved) <= 0.8 + 1e-9
+    assert abs(moved) <= 2.0 + 1e-9  # DEFAULT_LEAD_CAP_DEG
 
 
 def test_frames_render_the_synthetic_overhead_camera(arm: MetalArm) -> None:
@@ -68,3 +68,17 @@ def test_frames_render_the_synthetic_overhead_camera(arm: MetalArm) -> None:
 def test_real_backend_requires_a_port() -> None:
     with pytest.raises(ValueError, match="needs a port"):
         MetalArm(backend="slcan")
+
+
+def test_camera_name_guard_refuses_shifted_indices(monkeypatch) -> None:
+    from metal_arm_harness import camera
+
+    monkeypatch.setattr(
+        camera, "avfoundation_video_devices",
+        lambda: {0: "MacBook Pro Camera", 1: "KD-USB Cameras", 2: "KD-USB Cameras"},
+    )
+    camera.check_device_names("overhead=2,wrist=1", "KD-USB")  # fine
+    with pytest.raises(RuntimeError, match="MacBook"):
+        camera.check_device_names("front=0,wrist=1", "KD-USB")
+    monkeypatch.setattr(camera, "avfoundation_video_devices", lambda: None)
+    camera.check_device_names("front=0", "KD-USB")  # unknown platform: no-op
