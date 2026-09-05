@@ -25,8 +25,16 @@ def _build_metal(**options: Any) -> tuple[Arm, Kinematics]:
     return MetalArm(**options), kinematics
 
 
+def _build_maker(**options: Any) -> tuple[Arm, Kinematics]:
+    from metal_arm_harness.arms.maker import MakerArm
+    from metal_arm_harness.maker_kinematics import MakerKinematics
+
+    return MakerArm(**options), MakerKinematics()
+
+
 _FACTORIES = {
     "metal": _build_metal,
+    "maker": _build_maker,
 }
 
 

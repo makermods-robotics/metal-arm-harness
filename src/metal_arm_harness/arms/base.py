@@ -43,6 +43,12 @@ class ArmInfo:
     #: Model-facing operating notes: joint roles, gripper convention, zero
     #: pose — the facts, stated once, that make zero-shot control possible.
     notes: str
+    #: Named-arm operating conventions, never inferred from limit ordering.
+    gripper_open_deg: float = 112.0
+    gripper_closed_deg: float = 0.0
+    #: Empty tuple means the legacy zero rest pose; None means unverified/unsupported.
+    rest_positions_deg: tuple[float, ...] | None = ()
+    ik_joints: tuple[int, ...] = (0, 1, 2, 3)
 
     @property
     def joint_names(self) -> tuple[str, ...]:

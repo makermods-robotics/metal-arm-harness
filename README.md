@@ -30,7 +30,12 @@ through the safety envelope before a single CAN frame goes out. If you are
 an agent: read `docs/OPERATING.md` next — it is the procedure, the bench
 facts, and the mistakes already made for you.
 
-No hardware? `--backend sim` runs everything against a bench simulator.
+Maker Arm support is also included: `--arm maker` selects its RobStride profile,
+SDK-derived kinematics, and simulator. Real read-only diagnostics work; powered
+Maker operation still requires commissioning. See [Maker setup and current
+hardware findings](docs/MAKER.md) before using the connected arm.
+
+No hardware? `--backend sim` runs either arm against a bench simulator.
 
 ## The safety model
 
@@ -101,6 +106,8 @@ A P-controlled arm lags its command stream and sags under gravity. The
 
 ```
 arms/base.py      the Arm + Kinematics contracts (degrees, named joints)
+arms/maker.py     Maker over LeRobot + read-only diagnostics + simulator
+maker_kinematics.py Maker SDK CAD FK, provisional until physical alignment is verified
 arms/metal.py     Metal over LeRobot's DamiaoMotorsBus/MetalFollower + a sim
 arms/__init__.py  registry: build_arm("metal", ...) — new arms register here
 kinematics.py     Pinocchio FK on the vendored, checksummed URDF (+ tool pose)
@@ -116,7 +123,8 @@ docs/OPERATING.md the procedure for whoever (or whatever) is driving
 
 The harness core never imports a concrete arm. To add one: implement `Arm`
 (and `Kinematics`, without which the table guard is unavailable) and register
-a factory — the envelope, controller, operator session, and CLI are unchanged.
+a factory. Declare gripper endpoints, IK joints, and a verified rest target in
+`ArmInfo`; the generic controller and operator use these conventions.
 
 The low level is deliberately reused, not rewritten: `DamiaoMotorsBus` and
 `MetalFollower` come from lerobot's `arm/makermods-metal` branch, the CAN/MIT
@@ -135,3 +143,7 @@ uv venv && uv pip install -e . -e <lerobot checkout> pytest
 The whole stack runs in CI conditions with no hardware: the sim arm tracks
 commands perfectly, the operator session is exercised over a real Unix
 socket, and IK is checked against the vendored URDF.
+
+Table measurements are isolated by arm, robot ID, and backend under
+`~/.metal-arm-harness/tables/`. Legacy `table.json` remains on disk but must be
+remeasured once before `--reuse-table` works with this version.

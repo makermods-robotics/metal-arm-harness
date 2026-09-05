@@ -1,5 +1,7 @@
 # Operating the Metal arm through this harness
 
+**These bench facts apply to Metal only. For Maker Arm, read [MAKER.md](MAKER.md).**
+
 This is the procedure for whoever is driving — a person, or an agent that
 can run shell commands and look at JPEG files. Read it once, then follow it.
 The safety envelope stops you pressing the arm into the table; it does not

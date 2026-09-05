@@ -138,7 +138,9 @@ def settle(
     closing = True
     start_gripper = float(arm.read().positions_deg[gripper]) if gripper is not None else 0.0
     if gripper is not None:
-        closing = target[gripper] < start_gripper
+        closing = (target[gripper] - start_gripper) * (
+            arm.info.gripper_closed_deg - arm.info.gripper_open_deg
+        ) > 0
     last_command: np.ndarray | None = None
     while True:
         state = arm.read()

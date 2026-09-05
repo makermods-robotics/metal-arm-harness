@@ -112,7 +112,11 @@ def offset_target(
     table, left is 90° anticlockwise from it — plus the current pitch."""
     tip, pitch = kinematics.tool_pose(joints_deg)
     q = np.radians(np.asarray(joints_deg, dtype=np.float64))
-    heading = math.atan2(math.sin(q[0]), math.cos(q[0]))  # shoulder_pan sets the plane
+    heading = (
+        kinematics.tool_heading_rad(joints_deg)
+        if hasattr(kinematics, "tool_heading_rad")
+        else math.atan2(math.sin(q[0]), math.cos(q[0]))
+    )
     forward = np.array([math.cos(heading), math.sin(heading), 0.0])
     left = np.array([-math.sin(heading), math.cos(heading), 0.0])
     up = np.array([0.0, 0.0, 1.0])

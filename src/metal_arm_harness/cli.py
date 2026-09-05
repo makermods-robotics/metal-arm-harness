@@ -18,6 +18,7 @@ Session order is fixed and safety-motivated:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 from pathlib import Path
 from typing import Any
@@ -61,11 +62,11 @@ def _add_arm_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--port", default=None, help="slcan serial device or socketcan interface")
     parser.add_argument(
         "--robot-id",
-        default="metal_arm",
+        default=None,
         help=(
             "LeRobot robot id; selects the zero-pose calibration file "
-            "~/.cache/huggingface/lerobot/calibration/robots/metal_follower/<id>.json "
-            "that --armed requires (default: metal_arm)"
+            "~/.cache/huggingface/lerobot/calibration/robots/<arm>_follower/<id>.json "
+            "(default: <arm>_arm)"
         ),
     )
     parser.add_argument(
@@ -86,7 +87,7 @@ def _add_arm_options(parser: argparse.ArgumentParser) -> None:
         help=(
             "driver-layer cap on how far a command may lead the measured position, deg: "
             "a number for every joint, or overrides like shoulder_lift=5,gripper=8 on top of "
-            "the bench-tuned defaults (shoulder_lift 5, elbow_flex 3, gripper 8, others 2)"
+            "the arm defaults (Metal: shoulder 5/elbow 3/gripper 8/others 2; Maker: all 2)"
         ),
     )
 
@@ -95,7 +96,7 @@ def _add_floor_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--reuse-table",
         action="store_true",
-        help=f"skip the table ritual and reuse {_DEFAULT_CALIBRATION} (only if nothing moved)",
+        help="reuse this arm/robot/backend table measurement (only if nothing moved)",
     )
     parser.add_argument(
         "--table-z",
@@ -133,9 +134,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve.add_argument("--frames-dir", default="frames", help="where observe() saves JPEGs")
     serve.add_argument("--socket", default=str(DEFAULT_SOCKET))
+    serve.add_argument(
+        "--diagnostics-only", action="store_true",
+        help="read-only inspect/quit session; no floor ritual or motion",
+    )
 
     op = sub.add_parser("op", help="send one command to a running `serve` session")
-    op.add_argument("op_command", help="observe|goto|tip|nudge|gripper|open|close|rest|status|quit")
+    op.add_argument(
+        "op_command", help="observe|goto|tip|nudge|gripper|open|close|rest|status|inspect|quit"
+    )
     op.add_argument("op_args", nargs="*")
     op.add_argument("--socket", default=str(DEFAULT_SOCKET))
 
@@ -165,15 +172,20 @@ def _set_floor(
     """The hard floor, from an explicit value, a saved ritual, the sim, or the ritual."""
     if kinematics is None:
         return
+    if args.backend != "sim" and not getattr(kinematics, "hardware_verified", True):
+        raise RuntimeError(
+            "arm kinematics are unverified; use --diagnostics-only until commissioned"
+        )
+    calibration_path = _calibration_path(args)
     if args.table_z is not None:
         safety.set_floor(args.table_z)
         print(f"table height set explicitly: z={args.table_z:.4f} m")
     elif args.reuse_table:
-        calibration = load_calibration(_DEFAULT_CALIBRATION)
+        calibration = load_calibration(calibration_path)
         safety.set_floor(calibration.floor_z_m)
         print(
             f"reusing table calibration z={calibration.floor_z_m:.4f} m "
-            f"from {_DEFAULT_CALIBRATION} — only valid if the arm and table "
+            f"from {calibration_path} — only valid if the arm and table "
             "have not moved since"
         )
     elif args.backend == "sim":
@@ -184,9 +196,18 @@ def _set_floor(
         print(f"sim: synthetic table at z={floor:.4f} m")
     else:
         calibration = run_table_ritual(arm, kinematics)
-        save_calibration(calibration, _DEFAULT_CALIBRATION)
+        save_calibration(calibration, calibration_path)
         safety.set_floor(calibration.floor_z_m)
     log.event("floor_set", floor_z_m=safety.floor_z_m)
+
+
+def _calibration_path(args: argparse.Namespace) -> Path:
+    # Isolate both robot identity and backend: a simulator must never overwrite
+    # a real table measurement, and Maker must never inherit Metal's floor.
+    robot_id = args.robot_id or f"{args.arm}_arm"
+    identity = f"{args.arm}\0{robot_id}\0{args.backend}"
+    token = hashlib.sha256(identity.encode()).hexdigest()[:16]
+    return _DEFAULT_CALIBRATION.parent / "tables" / f"{token}.json"
 
 
 def _torque_gate(arm: Any, armed: bool, confirmed: bool = False) -> None:
@@ -203,7 +224,12 @@ def _torque_gate(arm: Any, armed: bool, confirmed: bool = False) -> None:
 
 
 def main_serve(args: argparse.Namespace) -> int:
-    if args.cameras and args.require_camera_name:
+    if args.diagnostics_only and args.armed:
+        raise ValueError("--diagnostics-only cannot be combined with --armed")
+    if (
+        not args.diagnostics_only and args.backend != "sim"
+        and args.cameras and args.require_camera_name
+    ):
         from metal_arm_harness.camera import check_device_names
 
         try:
@@ -216,15 +242,18 @@ def main_serve(args: argparse.Namespace) -> int:
         args.arm,
         backend=args.backend,
         port=args.port,
-        robot_id=args.robot_id,
-        cameras=args.cameras,
-        **({"lead_cap_deg": args.lead_cap} if args.lead_cap else {}),
+        robot_id=args.robot_id or f"{args.arm}_arm",
+        cameras="" if args.diagnostics_only else args.cameras,
+        **({"lead_cap_deg": args.lead_cap} if args.lead_cap is not None else {}),
     )
     safety = SafetyEnvelope(safety_config, arm.info, kinematics)
     log = EpisodeLog(args.log_dir)
     try:
+        if args.diagnostics_only and not hasattr(arm, "inspect"):
+            raise ValueError("this arm does not support diagnostics-only sessions")
         arm.connect()
-        _set_floor(args, arm, kinematics, safety, log)
+        if not args.diagnostics_only:
+            _set_floor(args, arm, kinematics, safety, log)
         _torque_gate(arm, args.armed, args.confirm_armed)
         session = OperatorSession(
             arm,
@@ -233,8 +262,12 @@ def main_serve(args: argparse.Namespace) -> int:
             Controller(arm, safety, armed=args.armed, log=log),
             frames_dir=Path(args.frames_dir),
             log=log,
+            diagnostics_only=args.diagnostics_only,
         )
-        print(session.handle("status", [])["text"])
+        if args.diagnostics_only:
+            print(f"{arm.info.name}: diagnostics only; use `op inspect` (no torque or motion)")
+        else:
+            print(session.handle("status", [])["text"])
         serve(session, Path(args.socket))
         return 0
     finally:
@@ -274,19 +307,24 @@ def main_calibrate(args: argparse.Namespace) -> int:
         args.arm,
         backend=args.backend,
         port=args.port,
-        robot_id=args.robot_id,
+        robot_id=args.robot_id or f"{args.arm}_arm",
         cameras="",
-        **({"lead_cap_deg": args.lead_cap} if args.lead_cap else {}),
+        **({"lead_cap_deg": args.lead_cap} if args.lead_cap is not None else {}),
     )
     if kinematics is None:
         print("this arm has no kinematics; there is no floor to calibrate", file=sys.stderr)
         return 2
     try:
+        if args.backend != "sim" and not getattr(kinematics, "hardware_verified", True):
+            raise RuntimeError(
+                "arm kinematics are unverified; table calibration requires commissioning"
+            )
         arm.connect()
         ask = watch_for_touch(arm, kinematics) if args.watch else input
         calibration = run_table_ritual(arm, kinematics, ask=ask)
-        save_calibration(calibration, _DEFAULT_CALIBRATION)
-        print(f"saved {_DEFAULT_CALIBRATION}: {calibration.to_json()}")
+        calibration_path = _calibration_path(args)
+        save_calibration(calibration, calibration_path)
+        print(f"saved {calibration_path}: {calibration.to_json()}")
         return 0
     finally:
         arm.close()
@@ -294,13 +332,17 @@ def main_calibrate(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.command == "serve":
-        return main_serve(args)
-    if args.command == "op":
-        return main_op(args)
-    if args.command == "ops":
-        return main_ops(args)
-    return main_calibrate(args)
+    try:
+        if args.command == "serve":
+            return main_serve(args)
+        if args.command == "op":
+            return main_op(args)
+        if args.command == "ops":
+            return main_ops(args)
+        return main_calibrate(args)
+    except (ValueError, RuntimeError, ConnectionError) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

@@ -43,8 +43,6 @@ from metal_arm_harness.ik import IKError, offset_target, solve_tip
 from metal_arm_harness.safety import MoveRejected, SafetyAbort, SafetyEnvelope
 
 DEFAULT_SOCKET = Path.home() / ".metal-arm-harness" / "operator.sock"
-GRIPPER_OPEN_DEG = 112.0
-GRIPPER_CLOSED_DEG = 0.0
 
 
 class OperatorError(RuntimeError):
@@ -62,12 +60,17 @@ class OperatorSession:
     frames_dir: Path
     log: EpisodeLog = field(default_factory=lambda: EpisodeLog(None))
     _frame_counter: int = 0
+    diagnostics_only: bool = False
 
     # ── commands ────────────────────────────────────────────────────────────
 
     def handle(self, command: str, args: list[str]) -> dict[str, Any]:
         """Dispatch one command. Never raises for operator mistakes."""
         try:
+            if self.diagnostics_only and command not in ("inspect", "quit"):
+                raise OperatorError(
+                    "diagnostics-only session: use inspect or quit; motion is disabled"
+                )
             handler = getattr(self, f"cmd_{command.replace('-', '_')}", None)
             if handler is None:
                 raise OperatorError(f"unknown command {command!r}")
@@ -76,7 +79,10 @@ class OperatorSession:
             return result
         except (OperatorError, MoveRejected, IKError, ValueError) as error:
             self.log.event("command_error", command=command, args=args, error=str(error))
-            return {"ok": False, "error": str(error), **self._state()}
+            return {
+                "ok": False, "error": str(error),
+                **({} if self.diagnostics_only else self._state()),
+            }
         except SafetyAbort as abort:
             self.log.event("safety_abort", reason=str(abort))
             relief = self._relieve_after_abort(str(abort))
@@ -99,6 +105,8 @@ class OperatorSession:
         return f" (torque relieved on {names}; wait for it to cool, then continue)"
 
     def cmd_clear_faults(self, args: list[str]) -> dict[str, Any]:
+        if not self.controller.armed:
+            raise OperatorError("fault recovery requires an armed session")
         cleared = self.arm.clear_faults()
         state = self.arm.read()
         remaining = [n for n, f in zip(self.arm.info.joint_names, state.faults, strict=False) if f]
@@ -110,6 +118,13 @@ class OperatorSession:
 
     def cmd_status(self, args: list[str]) -> dict[str, Any]:
         return {"text": self._state_text(), **self._state()}
+
+    def cmd_inspect(self, args: list[str]) -> dict[str, Any]:
+        if not hasattr(self.arm, "inspect"):
+            raise OperatorError("this arm has no read-only bus diagnostics; use status")
+        result = self.arm.inspect()
+        self.log.event("inspect", **result)
+        return {"text": json.dumps(result, indent=2), "diagnostics": result}
 
     def cmd_observe(self, args: list[str]) -> dict[str, Any]:
         tag = args[0] if args else "look"
@@ -124,17 +139,31 @@ class OperatorSession:
     def cmd_gripper(self, args: list[str]) -> dict[str, Any]:
         if len(args) != 1:
             raise OperatorError("gripper needs one value in degrees")
-        return self._move({"gripper": float(args[0])}, note=f"gripper {args[0]}")
+        return self._move({self._gripper_name(): float(args[0])}, note=f"gripper {args[0]}")
+
+    def _gripper_name(self) -> str:
+        index = self.arm.info.gripper_index
+        if index is None:
+            raise OperatorError("this arm has no gripper")
+        return self.arm.info.joint_names[index]
 
     def cmd_open(self, args: list[str]) -> dict[str, Any]:
-        return self._move({"gripper": GRIPPER_OPEN_DEG}, note="open")
+        return self._move({self._gripper_name(): self.arm.info.gripper_open_deg}, note="open")
 
     def cmd_close(self, args: list[str]) -> dict[str, Any]:
-        return self._move({"gripper": GRIPPER_CLOSED_DEG}, note="close")
+        return self._move({self._gripper_name(): self.arm.info.gripper_closed_deg}, note="close")
 
     def cmd_rest(self, args: list[str]) -> dict[str, Any]:
         names = self.arm.info.joint_names
-        targets = {n: 0.0 for i, n in enumerate(names) if i != self.arm.info.gripper_index}
+        rest = self.arm.info.rest_positions_deg
+        if rest is None:
+            raise OperatorError(
+                "this arm has no verified commanded rest pose; use an observed joint target"
+            )
+        targets = {
+            n: (rest[i] if rest else 0.0)
+            for i, n in enumerate(names) if i != self.arm.info.gripper_index
+        }
         return self._move(targets, note="rest")
 
     def cmd_tip(self, args: list[str]) -> dict[str, Any]:
@@ -177,6 +206,7 @@ class OperatorSession:
             target,
             pitch,
             limits=(self.safety._low, self.safety._high),
+            joints=self.arm.info.ik_joints,
         )
         clearance = self.safety.clearance_m(solution.joints_deg)
         if clearance is not None and clearance < self.safety.config.floor_margin_m:
@@ -247,6 +277,7 @@ class OperatorSession:
             self.arm.read().positions_deg if positions is None else positions, dtype=np.float64
         )
         state: dict[str, Any] = {
+            "arm": self.arm.info.name,
             "joints": {
                 n: round(float(v), 1) for n, v in zip(self.arm.info.joint_names, q, strict=True)
             },

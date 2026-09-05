@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "metal-arm-harness"
 version = "0.1.0"
-description = "A safety-enveloped operator harness for real robot arms that any agent can drive from the command line. Ships the MakerMods Metal arm; arm-agnostic above the driver layer."
+description = "A safety-enveloped operator harness for real robot arms that any agent can drive from the command line. Metal control plus Maker Arm simulation and read-only commissioning."
 readme = "README.md"
 # lerobot (the Damiao driver layer) requires >=3.12.
 requires-python = ">=3.12"
@@ -16,7 +16,7 @@ dependencies = [
     "numpy>=1.26",
     "pillow>=10.0",
     "pin>=3.0",              # Pinocchio, for forward kinematics
-    "lerobot[damiao]>=0.4",  # DamiaoMotorsBus + MetalFollower (see tool.uv.sources)
+    "lerobot[damiao]>=0.4",  # Metal + Robstride bus; pinned Maker follower compatibility copy included
 ]
 
 [project.optional-dependencies]
@@ -39,3 +39,6 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "C4", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/metal_arm_harness/_vendor/**" = ["ALL"]

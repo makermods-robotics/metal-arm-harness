@@ -5,6 +5,8 @@ There is no model API in the loop: **you are the policy.**
 
 - To operate the arm, follow `docs/OPERATING.md` (procedure, bench facts,
   camera reading, past mistakes) — or invoke the `metal-arm-pick-place` skill.
+- Maker Arm integration: read `docs/MAKER.md` for its current commissioning status;
+  Metal bench facts and gripper commands do not apply to Maker.
 - Motion always goes through `metal-arm-harness op …` against a running
   `metal-arm-harness serve`; never write to the CAN bus directly.
 - Tests: `.venv/bin/python -m pytest tests` (no hardware needed).
