@@ -16,7 +16,7 @@ waited on; one that stops while opening is blocked, and reported as such.
 from __future__ import annotations
 
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -46,12 +46,15 @@ def play(
     *,
     armed: bool,
     gripper_override: float | None = None,
+    on_command: Callable[[Sequence[float]], None] | None = None,
 ) -> MoveReport:
     """Send each waypoint at the control rate; re-check health between them.
 
     `gripper_override` replaces the gripper value of every sent waypoint: the
     jaws are not geometry, so a squeeze command (already inside the gripper's
     limits) rides along an approved arm path without being re-planned.
+    `on_command` observes each successful armed send before the next read,
+    so the owner retains the current hold even if a later tick aborts.
     """
     period = 1.0 / arm.info.control_hz
     started = time.monotonic()
@@ -62,7 +65,10 @@ def play(
         safety.check_runtime(state)
         trace.append(tuple(float(v) for v in state.positions_deg))
         if armed:
-            arm.send(_with_gripper(arm, waypoint, gripper_override))
+            command = _with_gripper(arm, waypoint, gripper_override)
+            arm.send(command)
+            if on_command is not None:
+                on_command(command)
         remaining = period - (time.monotonic() - tick)
         if remaining > 0:
             time.sleep(remaining)
@@ -110,6 +116,7 @@ def settle(
     initial_lead_deg: Sequence[float] | None = None,
     initial_command_deg: Sequence[float] | None = None,
     max_lead_deg: float = 2.0,
+    on_command: Callable[[Sequence[float]], None] | None = None,
 ) -> SettleReport:
     """Hold an approved target until the arm converges (or the jaws stall).
 
@@ -123,6 +130,7 @@ def settle(
     from the last sent command (or initial feedback for a standalone hold).
     initial_command_deg must be the actual previous command, not a goal.
     A planner veto propagates without a fallback write.
+    As in `play`, `on_command` observes each successful send immediately.
     """
     target = np.asarray(target_deg, dtype=np.float64)
     period = 1.0 / arm.info.control_hz
@@ -195,8 +203,11 @@ def settle(
         # A command-origin path can differ from the measured-to-desired path.
         # Check the actual next command from feedback before writing it.
         safety.plan_move(measured, command)
-        arm.send(_with_gripper(arm, command, gripper_override))
-        last_command = np.asarray(_with_gripper(arm, command, gripper_override))
+        values = _with_gripper(arm, command, gripper_override)
+        arm.send(values)
+        last_command = np.asarray(values)
+        if on_command is not None:
+            on_command(values)
         command_origin = last_command.copy()
         time.sleep(period)
     final = np.abs(arm.read().positions_deg - target)

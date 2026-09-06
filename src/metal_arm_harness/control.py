@@ -251,7 +251,8 @@ class Controller:
                 notes.append("later leg rejected by the envelope; stopped early.")
                 break
             report = executor.play(
-                self.arm, self.safety, waypoints, armed=self.armed, gripper_override=squeeze
+                self.arm, self.safety, waypoints, armed=self.armed, gripper_override=squeeze,
+                on_command=self._remember_command,
             )
             legs += 1
             steps += report.steps
@@ -261,10 +262,6 @@ class Controller:
             if leg_dip > dip:
                 dip, dip_joint = leg_dip, leg_dip_joint
             approved = waypoints[-1] if len(waypoints) else origin
-            if self.armed:
-                self.last_command = np.asarray(
-                    executor._with_gripper(self.arm, approved, squeeze), dtype=np.float64
-                )
             # Final leg (or a jaw-only one): hold the COMMANDED pose, which the settle
             # re-plans through the envelope every tick; intermediate legs hold their target.
             final_leg = jaw_only or bool(np.all(np.abs((leg_target - goal)[arm_mask]) < 1e-9))
@@ -285,6 +282,7 @@ class Controller:
                     # Carry the lag the stream ended with.
                     initial_lead_deg=(hold_target - after) * arm_mask,
                     max_lead_deg=MAX_CORRECTION_DEG,
+                    on_command=self._remember_command,
                 )
             except MoveRejected:
                 # A correction may have sent earlier steps before a later veto.
@@ -366,6 +364,16 @@ class Controller:
         )
         return result
 
+    def _remember_command(self, command: Sequence[float]) -> None:
+        """Keep the actual hold current even if the next tick aborts.
+
+        A partial move supersedes the previous completed goal with its actual
+        sent target, including any standing gripper squeeze. A completed goto
+        replaces this temporary hold with its intended goal.
+        """
+        self.last_command = np.asarray(command, dtype=np.float64).copy()
+        self.commanded = self.last_command.copy()
+
     def _origin(
         self, measured: npt.NDArray[np.float64], arm_mask: npt.NDArray[np.bool_]
     ) -> npt.NDArray[np.float64]:
@@ -390,7 +398,7 @@ class Controller:
         base = self.last_command.copy() if self.last_command is not None else measured.copy()
         base[joint] = measured[joint]
         self.arm.send([float(v) for v in base])
-        self.last_command = base
+        self._remember_command(base)
         self.log.event("relieve", joint=self.arm.info.joint_names[joint])
 
 
