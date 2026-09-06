@@ -188,6 +188,8 @@ class Controller:
         rule and the envelope rejects anything larger. Raises `MoveRejected` with
         nothing played when the first leg is not allowed; a rejection on a
         later leg is reported in `notes` with the arm settled where it got to.
+        A settling correction veto propagates immediately, possibly after earlier
+        writes, and discards cached command origins for the next request.
         """
         names = self.arm.info.joint_names
         goal = self.base()
@@ -270,17 +272,26 @@ class Controller:
             if final_leg:
                 hold_target[arm_mask] = goal[arm_mask]
             after = np.asarray(self.arm.read().positions_deg, dtype=np.float64)
-            settled = executor.settle(
-                self.arm,
-                self.safety,
-                hold_target,
-                armed=self.armed,
-                timeout_s=self.settle_timeout_s,
-                tol_deg=self.settle_tol_deg,
-                gripper_override=squeeze,
-                initial_lead_deg=(hold_target - after) * arm_mask,  # the lag the stream ended with
-                max_lead_deg=MAX_CORRECTION_DEG,
-            )
+            try:
+                settled = executor.settle(
+                    self.arm,
+                    self.safety,
+                    hold_target,
+                    armed=self.armed,
+                    timeout_s=self.settle_timeout_s,
+                    tol_deg=self.settle_tol_deg,
+                    gripper_override=squeeze,
+                    initial_command_deg=self.last_command,
+                    # Carry the lag the stream ended with.
+                    initial_lead_deg=(hold_target - after) * arm_mask,
+                    max_lead_deg=MAX_CORRECTION_DEG,
+                )
+            except MoveRejected:
+                # A correction may have sent earlier steps before a later veto.
+                # Discard cached origins; the next request must use fresh feedback.
+                self.last_command = None
+                self.commanded = None
+                raise
             if settled.last_command is not None:
                 self.last_command = np.asarray(settled.last_command, dtype=np.float64)
             if settled.gripper_blocked:

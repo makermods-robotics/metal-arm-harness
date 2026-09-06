@@ -154,7 +154,9 @@ def test_settle_holds_a_sagging_joint_on_target_and_the_next_move_does_not_dip()
     first = controller.goto({"shoulder_lift": -15.0}, chunk=True)
     # Integral action: the joint is measured ON target although it sags 1.2 deg below command.
     assert abs(arm.read().positions_deg[1] - (-15.0)) <= 0.5
-    assert bus.commands[-1]["shoulder_lift"] > -15.0 + 0.9  # command carries the lead
+    # A paced correction can enter the 0.5-degree tolerance before the
+    # former unpaced jump. Check the required gravity lead for that band.
+    assert bus.commands[-1]["shoulder_lift"] >= -15.0 + SaggingBus.SAG["shoulder_lift"] - 0.5
     held = bus.commands[-1]["shoulder_lift"]
 
     bus.commands.clear()

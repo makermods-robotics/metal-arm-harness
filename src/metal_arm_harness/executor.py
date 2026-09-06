@@ -23,7 +23,7 @@ import numpy as np
 import numpy.typing as npt
 
 from metal_arm_harness.arms.base import Arm
-from metal_arm_harness.safety import MoveRejected, SafetyEnvelope
+from metal_arm_harness.safety import SafetyEnvelope
 
 
 @dataclass(frozen=True)
@@ -108,6 +108,7 @@ def settle(
     stall_window_s: float = 0.6,
     gripper_override: float | None = None,
     initial_lead_deg: Sequence[float] | None = None,
+    initial_command_deg: Sequence[float] | None = None,
     max_lead_deg: float = 2.0,
 ) -> SettleReport:
     """Hold an approved target until the arm converges (or the jaws stall).
@@ -118,7 +119,10 @@ def settle(
     target instead of resting `sag` below it. `initial_lead_deg` carries the
     lead the previous command stream had built, so torque is continuous
     across the hand-over. Every tick's command is re-planned through the
-    envelope from the measured pose, so nothing unapproved is sent.
+    envelope from the measured pose. Commands advance one approved step
+    from the last sent command (or initial feedback for a standalone hold).
+    initial_command_deg must be the actual previous command, not a goal.
+    A planner veto propagates without a fallback write.
     """
     target = np.asarray(target_deg, dtype=np.float64)
     period = 1.0 / arm.info.control_hz
@@ -142,6 +146,15 @@ def settle(
             arm.info.gripper_closed_deg - arm.info.gripper_open_deg
         ) > 0
     last_command: np.ndarray | None = None
+    command_origin = (
+        np.asarray(initial_command_deg, dtype=np.float64).copy()
+        if initial_command_deg is not None
+        else None
+    )
+    if command_origin is not None and (
+        command_origin.shape != target.shape or not np.all(np.isfinite(command_origin))
+    ):
+        raise ValueError("initial_command_deg must match the finite target vector")
     while True:
         state = arm.read()
         safety.check_runtime(state)
@@ -162,14 +175,29 @@ def settle(
             break
         lead = np.clip(lead + HOLD_INTEGRAL_GAIN * residual * arm_mask, -max_lead_deg, max_lead_deg)
         desired = target + lead
-        try:
-            waypoints = safety.plan_move(measured, desired)
-        except MoveRejected:
-            desired = target  # fall back to the approved target itself
-            waypoints = np.asarray([desired])
-        command = waypoints[-1] if len(waypoints) else desired
+        # Feedback remains authoritative for excursion and floor validation.
+        # Never send the old target after a new measured-pose veto.
+        safety.plan_move(measured, desired)
+        if command_origin is None:
+            command_origin = measured.copy()
+        waypoints = safety.plan_move(command_origin, desired)
+        command = waypoints[0] if len(waypoints) else command_origin
+        # Sag can put feedback in the slow zone while the command origin is
+        # still above it. Retain the stricter measured-pose speed for the arm.
+        clearance = safety.clearance_m(measured)
+        if clearance is not None and clearance < safety.config.slow_zone_m:
+            slow_step = safety.config.slow_speed_deg_s / arm.info.control_hz
+            command = np.array(command, copy=True)
+            command[arm_mask] = command_origin[arm_mask] + np.clip(
+                command[arm_mask] - command_origin[arm_mask], -slow_step, slow_step
+            )
+            safety.plan_move(command_origin, command)
+        # A command-origin path can differ from the measured-to-desired path.
+        # Check the actual next command from feedback before writing it.
+        safety.plan_move(measured, command)
         arm.send(_with_gripper(arm, command, gripper_override))
         last_command = np.asarray(_with_gripper(arm, command, gripper_override))
+        command_origin = last_command.copy()
         time.sleep(period)
     final = np.abs(arm.read().positions_deg - target)
     stalled = gripper_stopped and closing
