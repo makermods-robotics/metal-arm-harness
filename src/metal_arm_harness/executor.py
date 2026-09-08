@@ -50,6 +50,7 @@ def play(
     armed: bool,
     gripper_override: float | None = None,
     sample: SampleCallback | None = None,
+    on_command: Callable[[Sequence[float]], None] | None = None,
 ) -> MoveReport:
     """Send each waypoint at the control rate; re-check health between them.
 
@@ -68,7 +69,10 @@ def play(
         if sample is not None:
             sample("play", state, _with_gripper(arm, waypoint, gripper_override))
         if armed:
-            arm.send(_with_gripper(arm, waypoint, gripper_override))
+            command = _with_gripper(arm, waypoint, gripper_override)
+            arm.send(command)
+            if on_command is not None:
+                on_command(command)
         remaining = period - (time.monotonic() - tick)
         if remaining > 0:
             time.sleep(remaining)
@@ -119,6 +123,7 @@ def settle(
     initial_lead_deg: Sequence[float] | None = None,
     max_lead_deg: float = 2.0,
     sample: SampleCallback | None = None,
+    on_command: Callable[[Sequence[float]], None] | None = None,
     correct_arm: bool = True,
 ) -> SettleReport:
     """Hold an approved target until the arm converges (or the jaws stall).
@@ -218,6 +223,8 @@ def settle(
         lead[arm_mask] = (command - target)[arm_mask]  # no windup past the sent trim
         arm.send(_with_gripper(arm, command, gripper_override))
         last_command = np.asarray(_with_gripper(arm, command, gripper_override))
+        if on_command is not None:
+            on_command(last_command)
         time.sleep(max(0.0, period - (time.monotonic() - tick)))
     final = np.abs(arm.read().positions_deg - target)
     stalled = gripper_stopped and closing

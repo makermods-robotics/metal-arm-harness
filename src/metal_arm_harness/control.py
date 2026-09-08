@@ -276,14 +276,22 @@ class Controller:
                     raise
                 notes.append("later leg rejected by the envelope; stopped early.")
                 break
-            report = executor.play(
-                self.arm,
-                self.safety,
-                waypoints,
-                armed=self.armed,
-                gripper_override=squeeze,
-                sample=self.record_sample,
-            )
+            try:
+                report = executor.play(
+                    self.arm,
+                    self.safety,
+                    waypoints,
+                    armed=self.armed,
+                    gripper_override=squeeze,
+                    sample=self.record_sample,
+                    on_command=self._remember_command,
+                )
+            except BaseException:
+                # Keep the actual hold if execution stops between successful writes.
+                self.commanded = (
+                    previous_goal if self.last_command is None else self.last_command.copy()
+                )
+                raise
             legs += 1
             steps += report.steps
             leg_dip, leg_dip_joint = _counter_dip(
@@ -302,19 +310,27 @@ class Controller:
             hold_target = approved.copy()
             if final_leg:
                 hold_target[arm_mask] = goal[arm_mask]
-            settled = executor.settle(
-                self.arm,
-                self.safety,
-                hold_target,
-                armed=self.armed,
-                timeout_s=self.settle_timeout_s,
-                tol_deg=self.settle_tol_deg,
-                gripper_override=squeeze,
-                initial_lead_deg=(approved - hold_target) * arm_mask,
-                max_lead_deg=MAX_CORRECTION_DEG,
-                sample=self.record_sample,
-                correct_arm=not jaw_only,
-            )
+            try:
+                settled = executor.settle(
+                    self.arm,
+                    self.safety,
+                    hold_target,
+                    armed=self.armed,
+                    timeout_s=self.settle_timeout_s,
+                    tol_deg=self.settle_tol_deg,
+                    gripper_override=squeeze,
+                    initial_lead_deg=(approved - hold_target) * arm_mask,
+                    max_lead_deg=MAX_CORRECTION_DEG,
+                    sample=self.record_sample,
+                    on_command=self._remember_command,
+                    correct_arm=not jaw_only,
+                )
+            except BaseException:
+                # Keep the actual hold if execution stops between successful writes.
+                self.commanded = (
+                    previous_goal if self.last_command is None else self.last_command.copy()
+                )
+                raise
             if settled.last_command is not None:
                 self.last_command = np.asarray(settled.last_command, dtype=np.float64)
             if settled.gripper_blocked:
@@ -389,6 +405,10 @@ class Controller:
         )
         return result
 
+    def _remember_command(self, command: Sequence[float]) -> None:
+        """Record successful sends immediately; telemetry keeps the intended goal."""
+        self.last_command = np.asarray(command, dtype=np.float64).copy()
+
     def _origin(
         self, measured: npt.NDArray[np.float64], arm_mask: npt.NDArray[np.bool_]
     ) -> npt.NDArray[np.float64]:
@@ -413,7 +433,8 @@ class Controller:
         base = self.last_command.copy() if self.last_command is not None else measured.copy()
         base[joint] = measured[joint]
         self.arm.send([float(v) for v in base])
-        self.last_command = base
+        self._remember_command(base)
+        self.commanded = self.last_command.copy()
         self.log.event("relieve", joint=self.arm.info.joint_names[joint])
 
 
