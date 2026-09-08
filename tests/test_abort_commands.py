@@ -99,3 +99,15 @@ def test_interrupted_move_retains_the_standing_gripper_squeeze(rig):
     assert arm.read().positions_deg[2] == 5
     assert controller.base()[2] == 0
     assert arm.sent[-1][2] == 0
+
+
+def test_command_tracking_preserves_the_intended_goal_in_telemetry(rig):
+    arm, controller, _session = rig
+    samples = []
+    controller.log.event = lambda kind, **data: samples.append((kind, data))
+    controller.goto({"joint1": 3})
+    motion = [data for kind, data in samples if kind == "motion_sample"]
+    assert len(motion) > 2
+    assert all(data["goal_deg"] == [0.0, 3.0, 0.0] for data in motion)
+    assert controller.commanded == pytest.approx([0, 3, 0])
+    assert controller.last_command == pytest.approx(arm.sent[-1])

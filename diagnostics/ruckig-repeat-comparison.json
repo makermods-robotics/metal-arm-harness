@@ -1,0 +1,66 @@
+{
+  "traces": [
+    {
+      "log": "logs/episode-20260905-174738.jsonl",
+      "move_id": 5,
+      "samples": 122,
+      "play_duration_s": 2.9088641830003326,
+      "dt_ms_percentiles": [
+        29.072399000142468,
+        40.3645480000705,
+        43.576830001256894,
+        62.15277899900684
+      ],
+      "overshoot_deg": [
+        0.41491676680199774,
+        2.441015173636657,
+        0.363913485912974,
+        0.5566339875221473,
+        0.032942778241404014,
+        0.0
+      ],
+      "travel_error_2_to_6_hz_rms_deg": [
+        0.14986126791964247,
+        0.22532110151059517,
+        0.7118418353412399,
+        0.08644110465555412,
+        0.016845479505772698,
+        0.0015246245208558186
+      ]
+    },
+    {
+      "log": "logs/episode-20260905-183234.jsonl",
+      "move_id": 5,
+      "samples": 133,
+      "play_duration_s": 3.700831656000446,
+      "dt_ms_percentiles": [
+        30.83969799990882,
+        40.419218000351975,
+        43.46561775018927,
+        55.46270299964817
+      ],
+      "overshoot_deg": [
+        0.0,
+        0.9524446074574797,
+        0.0,
+        0.0,
+        0.021961852160969908,
+        0.0
+      ],
+      "travel_error_2_to_6_hz_rms_deg": [
+        0.022824278900560678,
+        0.03025390453319686,
+        0.04009419361285553,
+        0.04200460843349298,
+        0.003981042266119612,
+        0.0
+      ]
+    }
+  ],
+  "limitations": [
+    "Different paths are not controlled A/B tests.",
+    "2-6 Hz RMS is a diagnostic band, not proof of a physical cause.",
+    "Encoders at ~25 Hz cannot rule out higher frequency vibration or structural flex.",
+    "last_applied is the previous driver send, timestamped separately; values precede wire quantization."
+  ]
+}

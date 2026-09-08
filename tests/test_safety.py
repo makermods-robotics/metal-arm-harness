@@ -112,14 +112,13 @@ def test_non_finite_target_is_rejected() -> None:
 def test_runtime_vetoes_overheating_and_bad_feedback() -> None:
     envelope = _envelope(with_kin=False)
     ok = ArmState(
-        positions_deg=np.zeros(2), velocities_deg_s=np.zeros(2),
+        positions_deg=np.zeros(2),
+        velocities_deg_s=np.zeros(2),
         temperatures_c=np.array([40.0, 40.0]),
     )
     envelope.check_runtime(ok)
     with pytest.raises(SafetyAbort, match="over the 70C limit"):
-        envelope.check_runtime(
-            ArmState(np.zeros(2), np.zeros(2), np.array([40.0, 88.0]))
-        )
+        envelope.check_runtime(ArmState(np.zeros(2), np.zeros(2), np.array([40.0, 88.0])))
     with pytest.raises(SafetyAbort, match="non-finite"):
         envelope.check_runtime(
             ArmState(np.array([np.nan, 0.0]), np.zeros(2), np.array([40.0, 40.0]))
@@ -128,9 +127,7 @@ def test_runtime_vetoes_overheating_and_bad_feedback() -> None:
 
 def test_bad_configs_are_refused() -> None:
     with pytest.raises(ValueError, match="slow_speed_deg_s must not exceed"):
-        SafetyEnvelope(
-            SafetyConfig(max_speed_deg_s=5.0, slow_speed_deg_s=10.0), _info(), None
-        )
+        SafetyEnvelope(SafetyConfig(max_speed_deg_s=5.0, slow_speed_deg_s=10.0), _info(), None)
     with pytest.raises(ValueError, match="floor_z_m"):
         _envelope().set_floor(float("inf"))
 
@@ -218,3 +215,31 @@ def test_describe_mentions_the_gripper_exemption() -> None:
 def test_inside_the_margin_even_half_a_millimetre_lower_is_rejected() -> None:
     with pytest.raises(MoveRejected, match="already"):
         _envelope().plan_move([5.0, 0.0], [4.5, 0.0])
+
+
+def test_ruckig_obeys_derivative_limits_and_synchronizes_arrival() -> None:
+    envelope = _envelope()
+    start = np.array([150.0, 0.0])
+    target = np.array([175.0, 10.0])
+    plan = envelope.plan_trajectory(start, target)
+    q = np.vstack([start, start, start, plan, target, target])
+    velocity = np.diff(q, axis=0) * HZ
+    acceleration = np.diff(velocity, axis=0) * HZ
+    jerk = np.diff(acceleration, axis=0) * HZ
+    assert np.max(np.abs(velocity)) <= 20 + 1e-7
+    assert np.max(np.abs(acceleration)) <= 20 + 1e-7
+    assert np.max(np.abs(jerk)) <= 80 + 1e-7
+    assert plan[-1] == pytest.approx(target)
+    assert (plan[:, 0] - start[0]) / 25 == pytest.approx(plan[:, 1] / 10)
+
+
+def test_ruckig_respects_floor_slow_zone_and_excursion() -> None:
+    envelope = _envelope()
+    plan = envelope.plan_trajectory([80.0, 0.0], [60.0, 10.0])
+    assert np.max(np.abs(np.diff(np.vstack([[80.0, 0.0], plan]), axis=0))) <= SLOW_STEP + 1e-8
+    with pytest.raises(MoveRejected, match="hard floor"):
+        envelope.plan_trajectory([40.0, 0.0], [5.0, 0.0])
+    with pytest.raises(MoveRejected, match="per-move"):
+        envelope.plan_trajectory([150.0, 0.0], [100.0, 0.0])
+    recovery = envelope.plan_trajectory([5.0, 0.0], [20.0, 0.0])
+    assert np.all(np.diff(recovery[:, 0]) >= -1e-10)

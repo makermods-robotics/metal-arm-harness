@@ -1,0 +1,49 @@
+{
+  "move_id": 5,
+  "play_samples": 73,
+  "play_period_ms_min_median_max": [
+    35.78258699963044,
+    40.349379999497614,
+    53.344449999713106
+  ],
+  "hold_samples": 199,
+  "hold_period_ms_min_median_max": [
+    28.072720000636764,
+    40.303620999111445,
+    60.53333300042141
+  ],
+  "hold_joint_range_deg": {
+    "shoulder_pan": 0.0,
+    "shoulder_lift": 0.21961852160958983,
+    "elbow_flex": 0.0,
+    "wrist_flex": 0.0,
+    "wrist_yaw": 0.0,
+    "wrist_roll": 0.0
+  },
+  "hold_tip_axis_range_mm": [
+    0.19750934680848786,
+    0.06409784560131015,
+    1.409490864990346
+  ],
+  "hold_command_arm_range_deg": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "measured_joint_overshoot_past_ik_goal_deg": {
+    "shoulder_pan": 0.41491676680199774,
+    "shoulder_lift": 2.441015173636657,
+    "elbow_flex": 0.363913485912974,
+    "wrist_flex": 0.5566339875221473,
+    "wrist_yaw": 0.032942778241404014,
+    "wrist_roll": 0.0
+  },
+  "limitations": [
+    "Position samples are ~25 Hz, cannot exclude faster vibration or structural flex.",
+    "Commands precede driver clipping and do not include velocity feedforward.",
+    "Hold recording starts later than the move; the time gap is deliberately not plotted as observed data."
+  ]
+}

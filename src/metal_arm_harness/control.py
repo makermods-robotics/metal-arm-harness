@@ -13,10 +13,10 @@ through this class, so the bench lessons live in one place:
 - **Settle with integral action.** After the last waypoint the target is
   held with `goal + lead`, `lead` integrating the residual (bounded,
   re-planned through the envelope every tick), which cancels the
-  steady-state gravity error: 0.1-0.3° instead of 1.3°.
+  steady-state gravity error toward the configured tolerance.
 - **No dip.** Each new waypoint stream starts from the last command that
   was actually sent (the held `goal + lead`), not from the measured pose,
-  and the settle inherits the lag the stream ended with. Otherwise every
+  and the settle inherits the exact command offset, not measured motion lag. Otherwise every
   move began by dropping the lead the shoulder needed against gravity and
   the arm visibly sank for a few ticks (seen on the bench).
 - **Stalled gripper = holding, and it stays that way.** Jaws that stop
@@ -44,7 +44,7 @@ import numpy as np
 import numpy.typing as npt
 
 from metal_arm_harness import executor
-from metal_arm_harness.arms.base import Arm, Observation
+from metal_arm_harness.arms.base import Arm, ArmState, Observation
 from metal_arm_harness.episode_log import EpisodeLog
 from metal_arm_harness.safety import MoveRejected, SafetyEnvelope
 
@@ -117,7 +117,10 @@ class GotoReport:
             else:
                 text += "."
         if self.counter_dip_deg >= 0.5:
-            text += f" Counter-dip {self.counter_dip_deg:.1f} deg on {self.counter_dip_joint}."
+            text += (
+                f" Measured reverse excursion {self.counter_dip_deg:.1f} deg"
+                f" on {self.counter_dip_joint}."
+            )
         for note in self.notes:
             text += f" {note}"
         return text
@@ -149,6 +152,27 @@ class Controller:
         self.last_command: npt.NDArray[np.float64] | None = None
         #: Jaw angle where the last grasp stalled, while an object is believed held.
         self.contact_deg: float | None = None
+        self.move_id = 0
+
+    def record_sample(self, phase: str, state: ArmState, command: Sequence[float] | None) -> None:
+        """Samples from the one bus owner; commands precede driver lead limiting."""
+        data = {
+            "move_id": self.move_id,
+            "phase": phase,
+            "monotonic_s": time.monotonic(),
+            "joint_names": self.arm.info.joint_names,
+            "measured_deg": state.positions_deg.tolist(),
+            "command_deg": None if command is None else list(map(float, command)),
+            "goal_deg": None if self.commanded is None else self.commanded.tolist(),
+            "efforts_nm": list(state.efforts_nm),
+            "velocity_deg_s": state.velocities_deg_s.tolist(),
+            "last_applied": getattr(self.arm, "last_applied", None),
+        }
+        kin = self.safety.kinematics
+        if kin is not None and hasattr(kin, "tool_pose"):
+            tip, pitch = kin.tool_pose(state.positions_deg)
+            data.update(tip_m=list(map(float, tip)), pitch_deg=float(pitch))
+        self.log.event("motion_sample", **data)
 
     # ── observation ─────────────────────────────────────────────────────────
 
@@ -188,8 +212,6 @@ class Controller:
         rule and the envelope rejects anything larger. Raises `MoveRejected` with
         nothing played when the first leg is not allowed; a rejection on a
         later leg is reported in `notes` with the arm settled where it got to.
-        A settling correction veto propagates immediately, possibly after earlier
-        writes, and discards cached command origins for the next request.
         """
         names = self.arm.info.joint_names
         goal = self.base()
@@ -201,9 +223,8 @@ class Controller:
         goal = self.safety.clamp_to_limits(goal)
         cap = self.safety.config.max_excursion_deg - 1.0 if chunk else None
         # A request that names only the gripper must plan as a pure jaw move: arm
-        # joints are left at their MEASURED values for the leg (so the envelope sees no
-        # geometry change and runs it at full speed even near the table); the correction
-        # passes afterwards still pull the arm back to its commanded pose.
+        # joints retain their held motor command for the entire leg and settle.
+        # Jaw motion must not remove gravity support or initiate arm corrections.
         gripper_index = self.arm.info.gripper_index
         jaw_only = (
             isinstance(targets, Mapping)
@@ -229,6 +250,10 @@ class Controller:
         previous: npt.NDArray[np.float64] | None = None
         dip = 0.0
         dip_joint = ""
+        self.move_id += 1
+        # Capture the new goal in telemetry without changing base selection above.
+        previous_goal = self.commanded
+        self.commanded = goal.copy()
         for _ in range(64):
             current = np.asarray(self.arm.read().positions_deg, dtype=np.float64)
             delta = goal - current
@@ -238,22 +263,35 @@ class Controller:
                 leg_target = current + np.clip(delta, -cap, cap)
                 if gripper is not None:
                     leg_target[gripper] = goal[gripper]  # jaws are exempt from the cap
-            if jaw_only:
-                leg_target[arm_mask] = current[arm_mask]
             if squeeze is not None and gripper is not None:
                 leg_target[gripper] = current[gripper]  # parked in the plan, squeezed via override
             origin = self._origin(current, arm_mask)
+            if jaw_only:
+                leg_target[arm_mask] = origin[arm_mask]  # retain the held motor command
             try:
-                waypoints = self.safety.plan_move(origin, leg_target)
+                waypoints = self.safety.plan_trajectory(origin, leg_target)
             except MoveRejected:
                 if legs == 0:
+                    self.commanded = previous_goal
                     raise
                 notes.append("later leg rejected by the envelope; stopped early.")
                 break
-            report = executor.play(
-                self.arm, self.safety, waypoints, armed=self.armed, gripper_override=squeeze,
-                on_command=self._remember_command,
-            )
+            try:
+                report = executor.play(
+                    self.arm,
+                    self.safety,
+                    waypoints,
+                    armed=self.armed,
+                    gripper_override=squeeze,
+                    sample=self.record_sample,
+                    on_command=self._remember_command,
+                )
+            except BaseException:
+                # Keep the actual hold if execution stops between successful writes.
+                self.commanded = (
+                    previous_goal if self.last_command is None else self.last_command.copy()
+                )
+                raise
             legs += 1
             steps += report.steps
             leg_dip, leg_dip_joint = _counter_dip(
@@ -262,13 +300,16 @@ class Controller:
             if leg_dip > dip:
                 dip, dip_joint = leg_dip, leg_dip_joint
             approved = waypoints[-1] if len(waypoints) else origin
+            if self.armed:
+                self.last_command = np.asarray(
+                    executor._with_gripper(self.arm, approved, squeeze), dtype=np.float64
+                )
             # Final leg (or a jaw-only one): hold the COMMANDED pose, which the settle
             # re-plans through the envelope every tick; intermediate legs hold their target.
             final_leg = jaw_only or bool(np.all(np.abs((leg_target - goal)[arm_mask]) < 1e-9))
             hold_target = approved.copy()
             if final_leg:
                 hold_target[arm_mask] = goal[arm_mask]
-            after = np.asarray(self.arm.read().positions_deg, dtype=np.float64)
             try:
                 settled = executor.settle(
                     self.arm,
@@ -278,17 +319,17 @@ class Controller:
                     timeout_s=self.settle_timeout_s,
                     tol_deg=self.settle_tol_deg,
                     gripper_override=squeeze,
-                    initial_command_deg=self.last_command,
-                    # Carry the lag the stream ended with.
-                    initial_lead_deg=(hold_target - after) * arm_mask,
+                    initial_lead_deg=(approved - hold_target) * arm_mask,
                     max_lead_deg=MAX_CORRECTION_DEG,
+                    sample=self.record_sample,
                     on_command=self._remember_command,
+                    correct_arm=not jaw_only,
                 )
-            except MoveRejected:
-                # A correction may have sent earlier steps before a later veto.
-                # Discard cached origins; the next request must use fresh feedback.
-                self.last_command = None
-                self.commanded = None
+            except BaseException:
+                # Keep the actual hold if execution stops between successful writes.
+                self.commanded = (
+                    previous_goal if self.last_command is None else self.last_command.copy()
+                )
                 raise
             if settled.last_command is not None:
                 self.last_command = np.asarray(settled.last_command, dtype=np.float64)
@@ -365,14 +406,8 @@ class Controller:
         return result
 
     def _remember_command(self, command: Sequence[float]) -> None:
-        """Keep the actual hold current even if the next tick aborts.
-
-        A partial move supersedes the previous completed goal with its actual
-        sent target, including any standing gripper squeeze. A completed goto
-        replaces this temporary hold with its intended goal.
-        """
+        """Record successful sends immediately; telemetry keeps the intended goal."""
         self.last_command = np.asarray(command, dtype=np.float64).copy()
-        self.commanded = self.last_command.copy()
 
     def _origin(
         self, measured: npt.NDArray[np.float64], arm_mask: npt.NDArray[np.bool_]
@@ -399,6 +434,7 @@ class Controller:
         base[joint] = measured[joint]
         self.arm.send([float(v) for v in base])
         self._remember_command(base)
+        self.commanded = self.last_command.copy()
         self.log.event("relieve", joint=self.arm.info.joint_names[joint])
 
 

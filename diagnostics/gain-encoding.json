@@ -1,0 +1,51 @@
+[
+  {
+    "joint": "shoulder_pan",
+    "configured_kp": 160.0,
+    "configured_kd": 6.5,
+    "encoded_kd_driver_units": 5.0,
+    "clipped": true
+  },
+  {
+    "joint": "shoulder_lift",
+    "configured_kp": 390.0,
+    "configured_kd": 11.0,
+    "encoded_kd_driver_units": 5.0,
+    "clipped": true
+  },
+  {
+    "joint": "elbow_flex",
+    "configured_kp": 320.0,
+    "configured_kd": 11.0,
+    "encoded_kd_driver_units": 5.0,
+    "clipped": true
+  },
+  {
+    "joint": "wrist_flex",
+    "configured_kp": 160.0,
+    "configured_kd": 5.0,
+    "encoded_kd_driver_units": 5.0,
+    "clipped": false
+  },
+  {
+    "joint": "wrist_yaw",
+    "configured_kp": 20.0,
+    "configured_kd": 0.6,
+    "encoded_kd_driver_units": 0.5995115995115995,
+    "clipped": false
+  },
+  {
+    "joint": "wrist_roll",
+    "configured_kp": 20.0,
+    "configured_kd": 0.6,
+    "encoded_kd_driver_units": 0.5995115995115995,
+    "clipped": false
+  },
+  {
+    "joint": "gripper",
+    "configured_kp": 20.0,
+    "configured_kd": 0.6,
+    "encoded_kd_driver_units": 0.5995115995115995,
+    "clipped": false
+  }
+]
