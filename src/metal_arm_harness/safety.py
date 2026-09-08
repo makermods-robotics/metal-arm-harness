@@ -56,7 +56,6 @@ from metal_arm_harness.arms.base import ArmInfo, ArmState, Kinematics
 _MAX_WAYPOINTS = 100_000
 
 
-
 class MoveRejected(Exception):
     """The move violates the envelope; the message is written for the driver."""
 
@@ -78,8 +77,14 @@ class SafetyConfig:
     max_excursion_deg: float = 35.0
     max_temp_c: float = 70.0
     limit_margin_deg: float = 0.5
+    max_acceleration_deg_s2: float = 20.0
+    max_jerk_deg_s3: float = 80.0
 
     def validate(self) -> None:
+        for name in ("max_acceleration_deg_s2", "max_jerk_deg_s3"):
+            value = getattr(self, name)
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and > 0")
         if not np.isfinite(self.max_speed_deg_s) or self.max_speed_deg_s <= 0:
             raise ValueError(f"max_speed_deg_s must be > 0, got {self.max_speed_deg_s!r}")
         if not np.isfinite(self.slow_speed_deg_s) or self.slow_speed_deg_s <= 0:
@@ -155,9 +160,7 @@ class SafetyEnvelope:
             raise SafetyAbort("joint feedback is non-finite; check bus wiring and power")
         raw = np.asarray(target_deg, dtype=np.float64)
         if raw.shape != current.shape:
-            raise MoveRejected(
-                f"target has {raw.shape} entries but the arm has {current.shape}"
-            )
+            raise MoveRejected(f"target has {raw.shape} entries but the arm has {current.shape}")
         if not bool(np.all(np.isfinite(raw))):
             raise MoveRejected("target contains a non-finite value")
         target = self.clamp_to_limits(raw)
@@ -189,6 +192,81 @@ class SafetyEnvelope:
         else:  # pragma: no cover - _MAX_WAYPOINTS is unreachable by design
             raise MoveRejected("move produced an unreasonable number of waypoints")
         return np.asarray(waypoints, dtype=np.float64).reshape(-1, current.size)
+
+    def plan_trajectory(
+        self, current_deg: Sequence[float], target_deg: Sequence[float]
+    ) -> npt.NDArray[np.float64]:
+        """Local Ruckig rest-to-rest trajectory, checked before any motor writes.
+
+        Legacy plan_move remains the conservative validation/rate limiter used
+        by small feedback trims. No cloud waypoint service is used.
+        """
+        from ruckig import (
+            DurationDiscretization,
+            InputParameter,
+            Result,
+            Ruckig,
+            Synchronization,
+            Trajectory,
+        )
+
+        checked = self.plan_move(current_deg, target_deg)
+        if not len(checked):
+            return checked
+        start = np.asarray(current_deg, dtype=np.float64)
+        target = checked[-1]
+        period = 1.0 / self.info.control_hz
+        inp = InputParameter(start.size)
+        inp.current_position = start.tolist()
+        inp.target_position = target.tolist()
+        inp.current_velocity = inp.target_velocity = [0.0] * start.size
+        inp.current_acceleration = inp.target_acceleration = [0.0] * start.size
+        inp.max_acceleration = [self.config.max_acceleration_deg_s2] * start.size
+        inp.max_jerk = [self.config.max_jerk_deg_s3] * start.size
+        inp.synchronization = Synchronization.Phase
+        inp.duration_discretization = DurationDiscretization.Discrete
+        generator = Ruckig(start.size, period)
+        trajectory = Trajectory(start.size)
+        floor_limit = self._floor_limit(start)
+        jaw_only = self._is_gripper_only(start, target)
+        speed = self.config.max_speed_deg_s
+        for _ in range(2):
+            inp.max_velocity = [speed] * start.size
+            try:
+                result = generator.calculate(inp, trajectory)
+            except Exception as exc:
+                raise MoveRejected(f"Ruckig could not generate a trajectory: {exc}") from exc
+            if result not in (Result.Working, Result.Finished):
+                raise MoveRejected(f"Ruckig rejected trajectory: {result}")
+            count = round(trajectory.duration / period)
+            if not 0 < count <= _MAX_WAYPOINTS:
+                raise MoveRejected("Ruckig produced an invalid trajectory duration")
+            points = np.array(
+                [
+                    trajectory.at_time(min(i * period, trajectory.duration))[0]
+                    for i in range(1, count + 1)
+                ]
+            )
+            points[-1] = target
+            if (
+                not jaw_only
+                and speed > self.config.slow_speed_deg_s
+                and any(self._in_slow_zone(q) for q in [start, *points])
+            ):
+                speed = self.config.slow_speed_deg_s
+                continue
+            if not np.all(np.isfinite(points)):
+                raise MoveRejected("non-finite Ruckig trajectory")
+            for previous, point in zip(np.vstack([start, points[:-1]]), points, strict=True):
+                if np.any(point < self._low - 1e-8) or np.any(point > self._high + 1e-8):
+                    raise MoveRejected("trajectory exceeds joint limits")
+                if np.max(np.abs(point - previous)) > speed * period + 1e-8:
+                    raise MoveRejected("trajectory exceeds speed limit")
+                # Also check intermediate poses, including recovery under the floor margin.
+                self.plan_move(previous, point)
+                self._check_floor(point, floor_limit)
+            return points
+        raise MoveRejected("could not generate a slow-zone trajectory")
 
     def _step_size(self, q: npt.NDArray[np.float64], target: npt.NDArray[np.float64]) -> float:
         """Full step in free space; slow step when either end is near the table."""

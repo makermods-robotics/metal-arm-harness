@@ -84,10 +84,10 @@ decide the next command. Commands return in ~0.1 s plus motion time.
 | `op clear-faults` | clear a latched motor fault (rotor overtemp etc.) and re-enable |
 | `op quit` | end; the arm keeps holding |
 
-Every move reply ends with a residual and, when it happened, `Counter-dip
+Every move reply ends with a residual and, when it happened, `Measured reverse excursion
 N deg on <joint>`: the largest excursion away from the target during the
-move. It should stay under 0.5°; if it grows, gravity lead is being lost
-between commands again (see §5).
+move. It is a diagnostic measurement, not a corrective action. If it grows, inspect
+the motion trace and camera views before continuing (see §5).
 
 Every reply ends with `clearance N mm` and `tip (x, y, z) m pitch P deg`.
 Plan in those numbers, not in joint angles.
@@ -185,3 +185,58 @@ you see and what you are about to do before each motion.
   move. Raising force instead tripped the motor fault (above).
 - **Grasp geometry**: grip the charger's middle at 12-18 mm tip clearance;
   a grip near its top edge popped out of the V-jaws on lift.
+
+## Recording endpoint motion
+
+`op trace-tip X Y Z PITCH [SECONDS]` uses the normal IK/envelope path and then
+records a read-only dwell (default 5 seconds). `op monitor 5` records the current
+hold without sending motor commands. Both return encoder peak-to-peak ranges
+and the episode log path. The log contains `motion_sample` events for play,
+settle and hold, with monotonic timestamps, encoder positions, requested commands,
+joint goals, torque and FK tip positions. `command_deg` is before driver lead limiting;
+`last_applied` records the preceding driver send with its own monotonic timestamp,
+post-limit position, zero velocity target and effective gains (before wire quantization).
+FK positions are encoder-derived estimates, not external camera measurements.
+
+Plot a move with `python scripts/plot_motion_trace.py LOG --move-id N` (requires
+matplotlib). Orange marks settling; green marks the read-only hold.
+
+Settling starts with the previous command offset, not the measured arrival lag.
+Integral trim is time-based, limited to 0.75 degrees/second and ±2 degrees, and
+stops adjusting joints within the 0.5-degree tolerance. Convergence also requires
+a 0.4-second stable window. Jaw-only commands retain the arm's held command
+without initiating position trim. A rejected trim retains the last approved hold.
+
+## Smooth trajectories and driver diagnostics
+
+Full moves now use standalone Ruckig 0.15.3, calculated locally without ROS or
+cloud services. Joint trajectories start and finish at zero velocity and acceleration,
+with phase synchronization, acceleration capped at 20 deg/s² and jerk at 80 deg/s³.
+The configured speed cap still applies; paths entering the slow zone run entirely at
+the slow speed. Every sampled pose passes the existing floor and limit checks.
+Small endpoint trims retain the bounded rate limiter described above.
+
+Metal position commands use zero desired motor velocity. The follower's inferred
+velocity feedforward is disabled: differentiating feedback-clipped goals introduced
+an additional feedback path, and its final nonzero velocity could remain latched.
+Configured Kd is capped at the driver's wire limit of 5; this makes the config honest
+and does not increase damping or change the protocol range. Motor stiffness is unchanged.
+
+`python scripts/compare_motion.py LOG:MOVE_ID [LOG:MOVE_ID ...] --output diagnostics/compare`
+plots shoulder/elbow encoders, requested/applied positions, requested speeds, and
+2-6 Hz tracking error. It writes PNG and JSON, excludes recording gaps, and needs
+numpy, scipy and matplotlib. Different paths are not controlled A/B tests; encoder
+sampling cannot exclude higher-frequency vibration or structural flex.
+
+When installing Ruckig from source with pip, use a build constraint
+`scikit-build-core<0.10` (the upstream 0.15.3 build uses the older configuration key).
+The uv project configuration supplies this constraint automatically. Ruckig supports
+macOS, Linux and Windows; this session's hardware validation runs on Linux only.
+
+For a deliberate restart of an already powered, stationary hold, first run
+`op monitor 3`, then `op quit`. Restart the same arm with `serve --resume-log LOG`
+and the same calibration/options. Resume sends no position command; it restores
+the previous goal, held command and grasp state only when the monitor is under five
+minutes old, the table and joints match, feedback is stationary and close, and the
+grip still has torque. This avoids dropping grip force during startup synchronization.
+Do not use resume after power cycling, moving the arm, or changing hardware.

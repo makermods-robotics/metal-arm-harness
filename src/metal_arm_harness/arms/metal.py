@@ -140,8 +140,13 @@ class MetalArm(Arm):
             can_interface="slcan" if backend == "sim" else backend,
             max_relative_target=_lead_caps(lead_cap_deg),
             cameras={},
+            velocity_feedforward=False,
         )
+        # The MIT wire protocol saturates Kd at 5. Keep configuration truthful;
+        # do not derive a second feedback loop from clipped position differences.
+        config.gains = {m: (kp, min(kd, 5.0)) for m, (kp, kd) in config.gains.items()}
         self._follower = MetalFollower(config)
+        self.last_applied: dict[str, Any] | None = None
         names = tuple(self._follower._joint_motor_names)
         self._status: dict[str, int] = {}
         if backend != "sim":
@@ -263,7 +268,13 @@ class MetalArm(Arm):
             f"{name}.pos": float(value)
             for name, value in zip(self.info.joint_names, targets_deg, strict=True)
         }
-        self._follower.send_action(action)
+        applied = self._follower.send_action(action)
+        self.last_applied = {
+            "monotonic_s": time.monotonic(),
+            "position_deg": [float(applied[f"{n}.pos"]) for n in self.info.joint_names],
+            "velocity_deg_s": [0.0] * len(self.info.joints),
+            "gains": self._follower._resolved_gains,
+        }
 
     def close(self) -> None:
         """Close the bus with torque untouched (a holding arm keeps holding)."""
@@ -327,8 +338,7 @@ class TrackingBus:
         if data_name in ("Kp", "Kd"):
             return
         if data_name == "Goal_Position":
-            self.goal_writes.append(dict(values))
-            self._positions.update({m: float(v) for m, v in values.items()})
+            self.sync_write_metal({m: (0.0, 0.0, float(v), 0.0, 0.0) for m, v in values.items()})
             return
         raise NotImplementedError(f"TrackingBus cannot sync_write {data_name!r}")
 
@@ -380,13 +390,13 @@ class SyntheticCamera:
 
     def _to_px(self, point: tuple[float, float]) -> tuple[int, int]:
         half = self._VIEW / 2.0
-        col = int(round((point[0] + half) / self._VIEW * (self._IMG - 1)))
-        row = int(round((half - point[1]) / self._VIEW * (self._IMG - 1)))
+        col = round((point[0] + half) / self._VIEW * (self._IMG - 1))
+        row = round((half - point[1]) / self._VIEW * (self._IMG - 1))
         return row, col
 
     def _square(self, image: Any, centre: tuple[float, float], half: float, colour: Any) -> None:
         row, col = self._to_px(centre)
-        span = max(2, int(round(half / self._VIEW * self._IMG)))
+        span = max(2, round(half / self._VIEW * self._IMG))
         image[max(0, row - span) : row + span + 1, max(0, col - span) : col + span + 1] = colour
 
     def _line(
@@ -396,6 +406,6 @@ class SyntheticCamera:
         r1, c1 = self._to_px(end)
         steps = max(abs(r1 - r0), abs(c1 - c0), 1)
         for k in range(steps + 1):
-            row = int(round(r0 + (r1 - r0) * k / steps))
-            col = int(round(c0 + (c1 - c0) * k / steps))
+            row = round(r0 + (r1 - r0) * k / steps)
+            col = round(c0 + (c1 - c0) * k / steps)
             image[max(0, row - 3) : row + 4, max(0, col - 3) : col + 4] = colour

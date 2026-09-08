@@ -15,6 +15,7 @@ authors = [{ name = "MakerMods" }]
 dependencies = [
     "numpy>=1.26",
     "pillow>=10.0",
+    "ruckig==0.15.3",        # standalone jerk-limited trajectories (no ROS)
     "pin>=3.0",              # Pinocchio, for forward kinematics
     "lerobot[damiao]>=0.4",  # Metal + Robstride bus; pinned Maker follower compatibility copy included
 ]
@@ -29,6 +30,9 @@ metal-arm-harness = "metal_arm_harness.cli:main"
 [tool.uv.sources]
 # The Metal robot classes live on lerobot's arm/makermods-metal branch, not on PyPI.
 lerobot = { git = "https://github.com/makermods-robotics/lerobot.git", branch = "arm/makermods-metal" }
+
+[tool.uv]
+build-constraint-dependencies = ["scikit-build-core<0.10"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/metal_arm_harness"]
