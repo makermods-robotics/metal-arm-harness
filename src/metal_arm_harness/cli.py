@@ -135,7 +135,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--frames-dir", default="frames", help="where observe() saves JPEGs")
     serve.add_argument("--socket", default=str(DEFAULT_SOCKET))
     serve.add_argument(
-        "--diagnostics-only", action="store_true",
+        "--resume-log", type=Path, help="restore a recent monitored powered hold; sends no motion"
+    )
+    serve.add_argument(
+        "--diagnostics-only",
+        action="store_true",
         help="read-only inspect/quit session; no floor ritual or motion",
     )
 
@@ -227,8 +231,10 @@ def main_serve(args: argparse.Namespace) -> int:
     if args.diagnostics_only and args.armed:
         raise ValueError("--diagnostics-only cannot be combined with --armed")
     if (
-        not args.diagnostics_only and args.backend != "sim"
-        and args.cameras and args.require_camera_name
+        not args.diagnostics_only
+        and args.backend != "sim"
+        and args.cameras
+        and args.require_camera_name
     ):
         from metal_arm_harness.camera import check_device_names
 
@@ -254,12 +260,17 @@ def main_serve(args: argparse.Namespace) -> int:
         arm.connect()
         if not args.diagnostics_only:
             _set_floor(args, arm, kinematics, safety, log)
+        controller = Controller(arm, safety, armed=args.armed, log=log)
+        if args.resume_log:
+            from metal_arm_harness.resume import resume_hold
+
+            resume_hold(controller, args.resume_log)
         _torque_gate(arm, args.armed, args.confirm_armed)
         session = OperatorSession(
             arm,
             kinematics,
             safety,
-            Controller(arm, safety, armed=args.armed, log=log),
+            controller,
             frames_dir=Path(args.frames_dir),
             log=log,
             diagnostics_only=args.diagnostics_only,

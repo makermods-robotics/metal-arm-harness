@@ -80,7 +80,8 @@ class OperatorSession:
         except (OperatorError, MoveRejected, IKError, ValueError) as error:
             self.log.event("command_error", command=command, args=args, error=str(error))
             return {
-                "ok": False, "error": str(error),
+                "ok": False,
+                "error": str(error),
                 **({} if self.diagnostics_only else self._state()),
             }
         except SafetyAbort as abort:
@@ -162,7 +163,8 @@ class OperatorSession:
             )
         targets = {
             n: (rest[i] if rest else 0.0)
-            for i, n in enumerate(names) if i != self.arm.info.gripper_index
+            for i, n in enumerate(names)
+            if i != self.arm.info.gripper_index
         }
         return self._move(targets, note="rest")
 
@@ -171,6 +173,58 @@ class OperatorSession:
             raise OperatorError("tip needs X Y Z (metres, base frame) and PITCH (deg)")
         x, y, z, pitch = (float(a) for a in args)
         return self._move_tip([x, y, z], pitch, note=f"tip {' '.join(args)}")
+
+    def cmd_trace_tip(self, args: list[str]) -> dict[str, Any]:
+        """Run the normal IK move, then record a read-only endpoint dwell."""
+        if len(args) not in (4, 5):
+            raise OperatorError("trace-tip needs X Y Z PITCH [hold seconds, default 5]")
+        seconds = self._monitor_duration(args[4:])
+        result = self.cmd_tip(args[:4])
+        hold = self.cmd_monitor([str(seconds)])
+        result.update(hold)
+        result["text"] = result["move"] + "\n" + hold["text"]
+        return result
+
+    @staticmethod
+    def _monitor_duration(args: list[str]) -> float:
+        if len(args) > 1:
+            raise OperatorError("monitor needs at most one duration in seconds")
+        seconds = float(args[0]) if args else 5.0
+        if not np.isfinite(seconds) or not 0.1 <= seconds <= 30:
+            raise OperatorError("monitor duration must be between 0.1 and 30 seconds")
+        return seconds
+
+    def cmd_monitor(self, args: list[str]) -> dict[str, Any]:
+        """Sample encoders without sending any motor commands."""
+        seconds = self._monitor_duration(args)
+        started = time.monotonic()
+        samples = []
+        tips = []
+        while time.monotonic() - started < seconds:
+            tick = time.monotonic()
+            state = self.arm.read()
+            self.safety.check_runtime(state)
+            self.controller.record_sample("hold", state, self.controller.last_command)
+            samples.append(state.positions_deg.copy())
+            if self.kinematics is not None and hasattr(self.kinematics, "tool_pose"):
+                tips.append(self.kinematics.tool_pose(state.positions_deg)[0])
+            time.sleep(max(0.0, 1 / self.arm.info.control_hz - (time.monotonic() - tick)))
+        ranges = np.ptp(samples, axis=0)
+        hold = {
+            "duration_s": time.monotonic() - started,
+            "samples": len(samples),
+            "joint_peak_to_peak_deg": dict(
+                zip(self.arm.info.joint_names, map(float, ranges), strict=True)
+            ),
+            "log": str(self.log.path) if self.log.path else None,
+        }
+        if tips:
+            hold["tip_axis_peak_to_peak_mm"] = (np.ptp(tips, axis=0) * 1000).tolist()
+        self.log.event("hold_summary", move_id=self.controller.move_id, **hold)
+        result = self._observe("hold")
+        result["hold"] = hold
+        result["text"] += "\nread-only hold: " + json.dumps(hold)
+        return result
 
     def cmd_nudge(self, args: list[str]) -> dict[str, Any]:
         kinematics = self._pose_kinematics()

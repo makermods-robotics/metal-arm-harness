@@ -78,3 +78,18 @@ def test_socket_round_trip(session: OperatorSession) -> None:
     assert send("quit", [], sock)["quit"]
     thread.join(timeout=5)
     assert not thread.is_alive()
+
+
+def test_monitor_is_read_only_and_reports_encoder_ranges(session) -> None:
+    before = len(session.arm._follower.bus.goal_writes)
+    reply = session.handle("monitor", ["0.12"])
+    assert reply["ok"] and reply["hold"]["samples"] >= 2
+    assert len(session.arm._follower.bus.goal_writes) == before
+    assert max(reply["hold"]["joint_peak_to_peak_deg"].values()) == 0
+
+
+def test_trace_tip_validates_dwell_before_motion(session) -> None:
+    before = len(session.arm._follower.bus.goal_writes)
+    reply = session.handle("trace-tip", ["0.25", "0", "0.15", "-80", "nan"])
+    assert not reply["ok"]
+    assert len(session.arm._follower.bus.goal_writes) == before

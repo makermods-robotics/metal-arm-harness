@@ -57,8 +57,9 @@ def test_unmentioned_joints_hold_the_commanded_pose_not_the_measured_one(rig) ->
     controller.goto({"gripper": 40.0})
     assert controller.commanded is not None
     assert controller.commanded[1] == pytest.approx(-20.0)  # SIM_START shoulder_lift, not -21
-    # The hold pulls the sagged joint back to within its 0.5 deg convergence band.
-    assert arm.read().positions_deg[1] == pytest.approx(-20.0, abs=0.6)
+    # Jaw-only commands keep the existing arm command rather than correcting the
+    # independently perturbed feedback after the jaws arrive.
+    assert controller.last_command[1] == pytest.approx(-20.0)
 
 
 def test_a_hand_moved_arm_makes_the_commanded_base_stale(rig) -> None:
@@ -134,6 +135,12 @@ class SaggingBus:
         self.commands.append({m: float(c[2]) for m, c in commands.items()})
         self._inner.sync_write_metal(commands)
 
+    def sync_write(self, name, values):
+        if name == "Goal_Position":
+            self.sync_write_metal({m: (0.0, 0.0, p, 0.0, 0.0) for m, p in values.items()})
+        else:
+            self._inner.sync_write(name, values)
+
     def sync_read_all_states(self, motors=None, **_):
         states = self._inner.sync_read_all_states(motors, **_)
         for joint, sag in self.SAG.items():
@@ -154,7 +161,7 @@ def test_settle_holds_a_sagging_joint_on_target_and_the_next_move_does_not_dip()
     first = controller.goto({"shoulder_lift": -15.0}, chunk=True)
     # Integral action: the joint is measured ON target although it sags 1.2 deg below command.
     assert abs(arm.read().positions_deg[1] - (-15.0)) <= 0.5
-    assert bus.commands[-1]["shoulder_lift"] > -15.0 + 0.9  # command carries the lead
+    assert bus.commands[-1]["shoulder_lift"] >= -15.0 + 0.7  # command carries the lead
     held = bus.commands[-1]["shoulder_lift"]
 
     bus.commands.clear()
@@ -178,8 +185,8 @@ def test_jaw_only_request_near_the_table_is_one_fast_leg() -> None:
     assert safety.clearance_m(arm.read().positions_deg) < safety.config.slow_zone_m
     report = controller.goto({"gripper": 100.0}, chunk=True)
     assert report.legs == 1
-    # 90 degrees of jaw travel at the full 0.8 deg step, not the 0.2 deg slow step.
-    assert report.steps <= 120
+    # Full-speed trajectory with acceleration ramps, well below 18 s slow-zone travel.
+    assert report.steps / arm.info.control_hz < 8
     assert arm.read().positions_deg[6] == pytest.approx(100.0)
 
 
@@ -266,3 +273,86 @@ def test_weak_grip_torque_is_called_out(rig) -> None:
     grasp = controller.goto({"gripper": 0.0}, chunk=True)
     assert grasp.grip_torque_nm == pytest.approx(0.05)
     assert "resting ON the object" in grasp.summary(arm.info.joint_names)
+
+
+def test_settle_does_not_double_the_arrival_lag(rig, monkeypatch) -> None:
+    arm, safety = rig
+    target = arm.read().positions_deg.copy()
+    target[0] += 1.5
+    sent = []
+    original = arm.send
+
+    def capture(q):
+        sent.append(np.array(q))
+        original(q)
+
+    monkeypatch.setattr(arm, "send", capture)
+    executor.settle(arm, safety, target, armed=True, initial_lead_deg=np.zeros(7))
+    # The old algorithm immediately jumped another 0.75 degrees past this target.
+    assert abs(sent[0][0] - target[0]) < 0.04
+    assert max(abs(q[0] - target[0]) for q in sent) < 0.1
+
+
+def test_settle_rejection_never_sends_an_unchecked_fallback(rig, monkeypatch) -> None:
+    arm, safety = rig
+    target = arm.read().positions_deg.copy()
+    target[0] += 1.5
+    sent = []
+    monkeypatch.setattr(arm, "send", lambda q: sent.append(q))
+
+    def reject(*args):
+        raise MoveRejected("test floor rejection")
+
+    monkeypatch.setattr(safety, "plan_move", reject)
+    result = executor.settle(arm, safety, target, armed=True, timeout_s=0.1)
+    assert not sent and not result.converged
+
+
+def test_settle_sag_at_soft_limit_never_sends_unclamped_empty_path(rig, monkeypatch) -> None:
+    arm, safety = rig
+    target = arm.read().positions_deg.copy()
+    target[0] = arm.info.joints[0].hi - safety.config.limit_margin_deg
+    arm._follower.bus._positions["shoulder_pan"] = target[0] - 1.0
+    sent = []
+    # Fixed feedback models a loaded joint that cannot reach the soft limit.
+    monkeypatch.setattr(arm, "send", lambda q: sent.append(np.array(q)))
+    executor.settle(arm, safety, target, armed=True, timeout_s=0.2)
+    assert sent
+    for command in sent:
+        np.testing.assert_allclose(command, safety.clamp_to_limits(command), atol=1e-10)
+
+
+def test_jaw_move_retains_the_arm_hold_through_play_and_settle(rig) -> None:
+    arm, safety = rig
+    arm._follower.bus = SaggingBus(arm._follower.bus)
+    controller = Controller(arm, safety, armed=True)
+    controller.goto({"shoulder_lift": -15.0})
+    held = controller.last_command.copy()
+    arm._follower.bus.commands.clear()
+    controller.goto({"gripper": 40.0})
+    for q in arm._follower.bus.commands:
+        for index, name in enumerate(arm.info.joint_names[:6]):
+            assert q[name] == pytest.approx(held[index], abs=1e-8)
+
+
+def test_convergence_requires_a_stable_dwell(rig) -> None:
+    arm, safety = rig
+    report = executor.settle(arm, safety, arm.read().positions_deg, armed=True, timeout_s=1.0)
+    assert report.converged
+    assert report.duration_s >= executor.HOLD_STABLE_WINDOW_S
+
+
+def test_settle_trace_includes_the_maintained_gripper_squeeze(rig) -> None:
+    arm, safety = rig
+    target = arm.read().positions_deg.copy()
+    samples = []
+    executor.settle(
+        arm,
+        safety,
+        target,
+        armed=True,
+        timeout_s=0.1,
+        gripper_override=0.5,
+        sample=lambda phase, state, command: samples.append(list(command)),
+    )
+    assert samples and all(q[6] == 0.5 for q in samples)

@@ -6,3 +6,8 @@ Log/
 .pytest_cache/
 *.egg-info/
 frames/
+frames-*/
+recordings/
+*-server.log
+.ruff_cache/
+dist/

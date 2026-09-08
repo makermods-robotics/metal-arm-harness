@@ -19,8 +19,13 @@ def arm() -> MetalArm:
 
 def test_info_declares_all_seven_joints(arm: MetalArm) -> None:
     assert arm.info.joint_names == (
-        "shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex",
-        "wrist_yaw", "wrist_roll", "gripper",
+        "shoulder_pan",
+        "shoulder_lift",
+        "elbow_flex",
+        "wrist_flex",
+        "wrist_yaw",
+        "wrist_roll",
+        "gripper",
     )
     assert arm.info.gripper_index == 6
     assert "0 is CLOSED" in arm.info.notes
@@ -54,6 +59,10 @@ def test_follower_relative_cap_bounds_a_wild_command(arm: MetalArm) -> None:
     arm.send([float(v) for v in wild])
     moved = arm.read().positions_deg[0] - start[0]
     assert abs(moved) <= 2.0 + 1e-9  # DEFAULT_LEAD_CAP_DEG
+    assert arm.last_applied["position_deg"][0] == pytest.approx(start[0] + moved)
+    assert arm.last_applied["velocity_deg_s"] == [0.0] * 7
+    assert not arm._follower.config.velocity_feedforward
+    assert max(kd for kp, kd in arm._follower.config.gains.values()) <= 5
 
 
 def test_frames_render_the_synthetic_overhead_camera(arm: MetalArm) -> None:
@@ -74,7 +83,8 @@ def test_camera_name_guard_refuses_shifted_indices(monkeypatch) -> None:
     from metal_arm_harness import camera
 
     monkeypatch.setattr(
-        camera, "avfoundation_video_devices",
+        camera,
+        "avfoundation_video_devices",
         lambda: {0: "MacBook Pro Camera", 1: "KD-USB Cameras", 2: "KD-USB Cameras"},
     )
     camera.check_device_names("overhead=2,wrist=1", "KD-USB")  # fine

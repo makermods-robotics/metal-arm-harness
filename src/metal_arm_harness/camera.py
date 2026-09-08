@@ -95,14 +95,48 @@ class OpenCVCamera:
         self._cap.release()
 
 
+class HTTPSnapshotCamera:
+    """Fetch a fresh JPEG from the existing local camera owner on every read."""
+
+    def __init__(self, name: str, target: str):
+        self.name, self.target = name, target
+        self.read()
+
+    def read(self) -> npt.NDArray[np.uint8]:
+        import io
+        import json
+        import urllib.request
+        from urllib.parse import urlsplit
+
+        from PIL import Image
+
+        url = urlsplit(self.target)
+        with urllib.request.urlopen(f"{url.scheme}://{url.netloc}/status", timeout=3) as response:
+            status = json.load(response)
+        if not status or any(c["age_s"] > 2 for c in status.values()):
+            raise RuntimeError("Camera service has stale frames; stop and inspect cameras")
+        with urllib.request.urlopen(self.target, timeout=3) as response:
+            return np.array(Image.open(io.BytesIO(response.read())).convert("RGB"))
+
+    def close(self) -> None:
+        pass
+
+
 def open_cameras(
     spec: str, width: int = DEFAULT_WIDTH, height: int = DEFAULT_HEIGHT
-) -> tuple[OpenCVCamera, ...]:
+) -> tuple[OpenCVCamera | HTTPSnapshotCamera, ...]:
     """Open every camera in the spec, releasing already-opened ones on failure."""
-    opened: list[OpenCVCamera] = []
+    opened: list[OpenCVCamera | HTTPSnapshotCamera] = []
     try:
         for entry in parse_camera_spec(spec):
-            opened.append(OpenCVCamera(entry.name, entry.target, width, height))
+            if (
+                isinstance(entry.target, str)
+                and entry.target.startswith("http://127.0.0.1:")
+                and entry.target.endswith(".jpg")
+            ):
+                opened.append(HTTPSnapshotCamera(entry.name, entry.target))
+            else:
+                opened.append(OpenCVCamera(entry.name, entry.target, width, height))
     except Exception:
         for camera in opened:
             camera.close()
@@ -121,7 +155,10 @@ def avfoundation_video_devices() -> dict[int, str] | None:
     try:
         out = subprocess.run(
             ["ffmpeg", "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
-            capture_output=True, text=True, timeout=10, check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
         ).stderr
     except (OSError, subprocess.SubprocessError):
         return None
@@ -159,5 +196,5 @@ def check_device_names(spec: str, required_substring: str) -> None:
             + "; ".join(wrong)
             + f". Expected names containing {required_substring!r}. A USB camera probably "
             "dropped off (indices shift): re-plug and re-check with "
-            "`ffmpeg -f avfoundation -list_devices true -i \"\"`."
+            '`ffmpeg -f avfoundation -list_devices true -i ""`.'
         )
